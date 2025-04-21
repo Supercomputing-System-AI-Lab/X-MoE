@@ -94,7 +94,8 @@ from .pipe.module import PipelineModule
 from .utils import get_ma_status
 from .compiler import is_compile_supported
 from ..ops.adam import FusedAdam
-from ..moe.sharded_moe import TopKGate, MOELayer
+from ..moe.sharded_moe import TopKGate, MOELayer, UnblancedMOELayer
+from ..moe.moe_v2 import TopKGatev2, MOEv2Layer
 from ..moe.layer import MoE
 from ..moe.utils import is_moe_param, configure_moe_param_groups
 from ..git_version_info import version
@@ -1176,6 +1177,18 @@ class DeepSpeedEngine(Module):
                     self.moe_layers.append(module)
                     if self.wall_clock_breakdown():
                         module.wall_clock_breakdown = True
+                if isinstance(module, UnblancedMOELayer):
+                    self.moe_layers.append(module)
+                    if self.wall_clock_breakdown():
+                        module.wall_clock_breakdown = True
+                if isinstance(module, MOEv2Layer):
+                    self.moe_layers.append(module)
+                    if self.wall_clock_breakdown():
+                        module.wall_clock_breakdown = True
+                if isinstance(module, TopKGatev2):
+                    self.gate_modules.append(module)
+                    if self.wall_clock_breakdown():
+                        module.wall_clock_breakdown = True
 
         # Pass the mpu from here to groups. For subsequent use, just query groups
         if self.mpu is not None:
@@ -1946,6 +1959,9 @@ class DeepSpeedEngine(Module):
         moe_time = 0.0
         falltoall = 0.0
         salltoall = 0.0
+        experts_time = 0.0
+        dispatch_time = 0.0
+        combine_time = 0.0
 
         for gate in self.gate_modules:
             #logger.info(f"Individual TopK gate time: {gate.gate_time:.2f} ms")
@@ -1956,12 +1972,15 @@ class DeepSpeedEngine(Module):
             moe_time += l.time_moe
             falltoall += l.time_falltoall
             salltoall += l.time_salltoall
+            experts_time += l.time_experts
+            dispatch_time += l.time_dispatch
+            combine_time += l.time_combine
 
         # TODO: Allreduce/average them across ranks for more accurate timing.
 
         # if deepspeed.comm.get_rank() == 0:
         log_dist(
-            f"time (ms) | fwd: {fwd_time:.2f} (fwd_moe: {moe_time:.2f}, 1st_a2a: {falltoall:.2f}, 2nd_a2a: {salltoall:.2f}, top_k: {gate_time:.2f})",
+            f"time (ms) | fwd: {fwd_time:.2f} (fwd_moe: {moe_time:.2f}, 1st_a2a: {falltoall:.2f}, experts: {experts_time:.2f}, 2nd_a2a: {salltoall:.2f}, top_k: {gate_time:.2f}), dispatch: {dispatch_time:.2f}, combine: {combine_time:.2f}",
             ranks=[0])
 
     @instrument_w_nvtx

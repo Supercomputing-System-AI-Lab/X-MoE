@@ -43,10 +43,13 @@ _ZERO_PARAM_INTRA_PARALLEL_GROUP = None
 mpu = None
 # global object that stores tensor parallel world size for experts
 expert_tensor_parallel_world_size = 1
+expert_sequence_parallel_world_size = 1
 # All to All quantized graident communication groups
 _ALL_TO_ALL_GROUP = {}
 
 _DATA_PARALLEL_GROUP = None
+
+_RBD_LOCAL_GROUP = {}
 
 mesh_device = None
 
@@ -114,7 +117,7 @@ def _create_model_parallel(model_parallel_size_):
     return _DATA_PARALLEL_GROUP, _MODEL_PARALLEL_GROUP
 
 
-def _create_expert_and_data_parallel(expert_parallel_size_, use_data_before_expert_parallel_=False):
+def _create_expert_and_data_parallel(expert_parallel_size_, use_data_before_expert_parallel_=False, max_interval=4):
     """
         Create expert and data parallel groups.
 
@@ -143,14 +146,25 @@ def _create_expert_and_data_parallel(expert_parallel_size_, use_data_before_expe
     # Build the expert data parallel groups.
     global _EXPERT_DATA_PARALLEL_GROUP
 
-    ep_stride = pp_stride // expert_parallel_size_
+    if use_data_before_expert_parallel_ and max_interval is not None and expert_parallel_size_ * max_interval < world_size:
+        ep_global_group_size = expert_parallel_size_ * max_interval
+        assert world_size % ep_global_group_size == 0
+        num_ep_global_groups = world_size // ep_global_group_size
+        ep_stride = max_interval
+    else:
+        ep_global_group_size = world_size
+        num_ep_global_groups = 1
+        ep_stride = pp_stride // expert_parallel_size_
 
     # Only create group if it does not already exist
     if group_name not in _EXPERT_DATA_PARALLEL_GROUP:
         for pp_stage_start in range(0, world_size, pp_stride):
             for i in range(expert_parallel_size_):
                 if use_data_before_expert_parallel_:
-                    ranks = range(pp_stage_start + i * ep_stride, pp_stage_start + (i + 1) * ep_stride)
+                    ranks = []
+                    for global_group_idx in range(num_ep_global_groups):
+                        ranks = ranks + list(range(ep_global_group_size * global_group_idx + pp_stage_start + i * ep_stride, 
+                                      ep_global_group_size * global_group_idx + pp_stage_start + (i + 1) * ep_stride))
                 else:
                     ranks = range(pp_stage_start + i, pp_stage_start + pp_stride, expert_parallel_size_)
                 group = dist.new_group(ranks)
@@ -167,14 +181,16 @@ def _create_expert_and_data_parallel(expert_parallel_size_, use_data_before_expe
     if group_name not in _EXPERT_PARALLEL_GROUP:
         if use_data_before_expert_parallel_:
             for pp_stage_start in range(0, world_size, pp_stride):
-                for i in range(ep_stride):
-                    ranks = range(pp_stage_start + i, pp_stage_start + pp_stride, ep_stride)
-                    group = dist.new_group(ranks)
-                    log_dist(
-                        f'creating expert parallel process group named {group_name} '
-                        f'with ranks: {list(ranks)}', [0])
-                    if rank in ranks:
-                        _EXPERT_PARALLEL_GROUP[group_name] = group
+                for global_group_idx in range(num_ep_global_groups):
+                    for i in range(ep_stride):
+                        ranks = range(global_group_idx * ep_global_group_size + pp_stage_start + i,
+                                      (global_group_idx + 1) * ep_global_group_size + pp_stage_start, ep_stride)
+                        group = dist.new_group(ranks)
+                        log_dist(
+                            f'creating expert parallel process group named {group_name} '
+                            f'with ranks: {list(ranks)}', [0])
+                        if rank in ranks:
+                            _EXPERT_PARALLEL_GROUP[group_name] = group
         else:
             for i in range(world_size // expert_parallel_size_):
                 ranks = range(i * expert_parallel_size_, (i + 1) * expert_parallel_size_)
@@ -253,6 +269,79 @@ def _get_expert_parallel_ranks(world_size,
 
     return expert_parallel_groups, expert_data_parallel_groups
 
+def _get_expert_parallel_ranks_with_sp(world_size,
+                               sequence_parallel_size_,
+                               expert_parallel_size_,
+                               pipeline_parallel_size_=1,
+                               use_data_before_expert_parallel_=False):
+    """Generate expert parallel and expert data parallel group ranks list.
+
+        Example - E + M + D parallel
+        world_size = 16
+        model_degree = 2
+        expert_degree = 4 # number of experts in same group
+        mp_group = [0, 1], [2,3], [4,5] ...
+        data_parallel_group =[0,2,4,6,8,10, 12,14],                 [1,3,5,7,9,11,13,15]
+        expert_parallel_group = [0,2,4,6], [8,10,12,14]             [1,3,5,7], [9,11,13,15]
+        expert_data_parallel_group = [0,8],[2,10],[4,12],[6,14],    [1,9],[3,11],[5,13],[7,15]
+
+    Args:
+        world_size (int): Distributed world size.
+        tensor_parallel_size_ (int): Tensor parallel group size.
+        expert_parallel_size_ (int): Expert parallel group size.
+        pipeline_parallel_size_ (int): Pipeline parallel group size
+        use_data_before_expert_parallel_ (bool): Use the D + E instead of E + D topology
+    Returns:
+        Expert parallel group ranks and Expert data parallel group ranks list.
+    """
+    _ensure_divisibility(world_size, sequence_parallel_size_ * pipeline_parallel_size_)
+    dp_world_size = world_size // (sequence_parallel_size_ * pipeline_parallel_size_)
+    _ensure_divisibility(dp_world_size, expert_parallel_size_)
+
+    # Generate data parallel groups
+    data_parallel_groups = []
+    dp_group_size = sequence_parallel_size_
+    pp_stride = world_size // pipeline_parallel_size_
+
+    if use_data_before_expert_parallel_:
+        raise NotImplementedError
+        dp_stride = world_size // expert_parallel_size_ // tensor_parallel_size_ // pipeline_parallel_size_
+        for pp_stage_start in range(0, world_size, pp_stride):
+            pp_stage_next = pp_stage_start + pp_stride
+            for i in range(dp_group_size):
+                data_parallel_groups.append(list())
+                for ds in range(dp_stride):
+                    # [0, 4, 8, 12, 16, 20, 24, 28, 2, 6, 10, 14, 18, 22, 26, 30]
+                    # [1, 5, 9, 13, 17, 21, 25, 29, 3, 7, 11, 15, 19, 23, 27, 31]
+                    data_parallel_groups[-1].extend(
+                        list(
+                            range(pp_stage_start + i + ds * tensor_parallel_size_, pp_stage_next,
+                                  dp_stride * tensor_parallel_size_)))
+    else:
+        for pp_stage_start in range(0, world_size, pp_stride):
+            pp_stage_next = pp_stage_start + pp_stride
+            for i in range(dp_group_size):
+                data_parallel_groups.append(list(range(pp_stage_start + i, pp_stage_next, dp_group_size)))
+
+    expert_parallel_groups = []
+    num_expert_data_groups = expert_parallel_size_ # number of elements in each zip group
+    # expert_data_parallel_groups = []
+    expert_data_parallel_groups = [[] for _ in range(num_expert_data_groups)]
+
+    for dp_ranks in data_parallel_groups:
+        # partition of expert parallel groups, e.g. [0,2,4,6], [8,10,12,14]
+        part_ep_groups = []
+        for i in range(0, dp_world_size, expert_parallel_size_):
+            part_ep_groups.append(dp_ranks[i:i + expert_parallel_size_])
+        expert_parallel_groups.extend(part_ep_groups)
+
+        # zip part_ep_groups get expert data parallel ranks, e.g [0,8],[2,10],[4,12],[6,14]
+        for expert_dp_ranks in part_ep_groups:
+            for j, expert_dp_rank in enumerate(expert_dp_ranks):
+                expert_data_parallel_groups[j].extend([expert_dp_rank])
+
+    return expert_parallel_groups, expert_data_parallel_groups
+
 
 def _create_expert_data_and_model_parallel(expert_parallel_size_, mpu, use_data_before_expert_parallel_=False):
     """
@@ -306,6 +395,106 @@ def _create_expert_data_and_model_parallel(expert_parallel_size_, mpu, use_data_
             group = dist.new_group(ranks)
             if rank in list(ranks):
                 _EXPERT_DATA_PARALLEL_GROUP[group_name] = group
+
+
+def _create_expert_data_and_sequence_parallel(expert_parallel_size_, mpu, use_data_before_expert_parallel_=False):
+    """
+        Create expert and data parallel groups based on MPU (model parallel) group.
+
+        Note: Caller of this function is responsible to check if the groups already exist.
+
+        Example - E + M + D parallel
+        world_size = 16
+        sequence_degree = 2
+        expert_degree = 4 # number of experts in same group
+        sp_group = [0, 1], [2,3], [4,5] ...
+        data_parallel_group =[0,2,4,6,8,10, 12,14],                 [1,3,5,7,9,11,13,15]
+        expert_parallel_group = [0,2,4,6], [8,10,12,14]             [1,3,5,7], [9,11,13,15]
+        expert_data_parallel_group = [0,8],[2,10],[4,12],[6,14],    [1,9],[3,11],[5,13],[7,15]
+        TODO: expert_data_parallel_group = [0,1,8,9],[2,3,10,11],[4,5,12,13],[6,7,14,15]
+    """
+    assert dist.is_initialized(), "dist is not initialized"
+    tensor_parallel_size_ = bwc_tensor_model_parallel_world_size(mpu)
+
+    global expert_sequence_parallel_world_size
+    expert_sequence_parallel_world_size = tensor_parallel_size_
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    dp_world_size = mpu.get_data_parallel_world_size()
+    pp_world_size = 1 if mpu is None else bwc_pipeline_parallel_world_size(mpu)
+
+    _ensure_divisibility(world_size, tensor_parallel_size_)
+    _ensure_divisibility(dp_world_size, expert_parallel_size_)
+
+    log_dist(
+        f"Creating deepspeed groups with sequence parallel size {tensor_parallel_size_}, "
+        f"pipeline parallel size {pp_world_size}, expert parallel size {expert_parallel_size_}, "
+        f"world size {world_size}, dp world size {dp_world_size}", [0])
+
+    global _EXPERT_PARALLEL_GROUP, _EXPERT_DATA_PARALLEL_GROUP
+
+    group_name = f"ep_size_{expert_parallel_size_}"
+
+    # Only create groups if they don't already exist
+    # Need to check conditions outside the group creation loop because of the way torch.dist group creation works
+    if group_name not in _EXPERT_DATA_PARALLEL_GROUP and group_name not in _EXPERT_PARALLEL_GROUP:
+        expert_parallel_groups, expert_data_parallel_groups = _get_expert_parallel_ranks_with_sp(
+            world_size, tensor_parallel_size_, expert_parallel_size_, pp_world_size, use_data_before_expert_parallel_)
+        for ranks in expert_parallel_groups:
+            log_dist(f"expert parallel group ranks:{list(ranks)}", [0])
+            group = dist.new_group(ranks)
+            if rank in list(ranks):
+                _EXPERT_PARALLEL_GROUP[group_name] = group
+
+        for ranks in expert_data_parallel_groups:
+            log_dist(f"expert data parallel group ranks:{list(ranks)}", [0])
+            group = dist.new_group(ranks)
+            if rank in list(ranks):
+                _EXPERT_DATA_PARALLEL_GROUP[group_name] = group
+
+def _create_rbd_local_group(expert_parallel_size_, mesh_size=8, enable_expert_tensor_parallelism=False, mpu=None):
+
+    global expert_sequence_parallel_world_size
+    if mpu is not None and enable_expert_tensor_parallelism:
+        mesh_size = mesh_size // expert_sequence_parallel_world_size
+
+        
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    
+    mesh_size = min(world_size, mesh_size)
+    pp_world_size = 1 if mpu is None else bwc_pipeline_parallel_world_size(mpu)
+    
+    print("expert_parallel_size_")
+    print(expert_parallel_size_)
+    print("mesh_size")
+    print(mesh_size)
+    assert expert_parallel_size_ >= mesh_size
+    assert pp_world_size == 1
+
+    if expert_sequence_parallel_world_size > 1:
+        raise NotImplementedError
+
+    rbd_local_groups, _ = _get_expert_parallel_ranks(
+            world_size, expert_sequence_parallel_world_size, mesh_size)
+
+    group_name = f"local_size_{mesh_size}"
+    
+    if group_name not in _RBD_LOCAL_GROUP:
+        for ranks in rbd_local_groups:
+            log_dist(f"RBD local group ranks:{list(ranks)}", [0])
+            group = dist.new_group(ranks)
+            if rank in list(ranks):
+                _RBD_LOCAL_GROUP[group_name] = group
+
+
+    
+def _get_rbd_local_group(group_name):
+    """Get the expert parallel group dict."""
+    return _RBD_LOCAL_GROUP[group_name]
+
+
 
 
 def _get_max_expert_size():
@@ -527,6 +716,9 @@ def _get_expert_model_parallel_world_size():
     global expert_tensor_parallel_world_size
     return expert_tensor_parallel_world_size
 
+def _get_expert_sequence_parallel_world_size():
+    global expert_sequence_parallel_world_size
+    return expert_sequence_parallel_world_size
 
 def _create_zero_param_parallel_group(group_size):
     """

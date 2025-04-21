@@ -25,6 +25,7 @@ import torch
 import deepspeed
 from deepspeed.utils.bwc import (bwc_tensor_model_parallel_world_size, bwc_tensor_model_parallel_rank,
                                  bwc_tensor_model_parallel_group)
+USE_SP = True
 
 
 def _gather_tokens(input_, dim=0):

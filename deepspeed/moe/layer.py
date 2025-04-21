@@ -11,8 +11,12 @@ from torch.nn import functional as F
 
 from deepspeed.utils import groups, log_dist
 from .experts import Experts
-from .sharded_moe import MOELayer, TopKGate
+from .sharded_moe import MOELayer, UnblancedMOELayer, TopKGate, see_memory_usage
+from .moe_v2 import MOEv2Layer, TopKGatev2
+from .moe_rbd import TopKGateRBD, MOEv2LayerRBD
+from .v2opt.utils import print_rank
 
+SEE_MEMORY = False
 
 class MoE(nn.Module):
     """Initialize an MoE layer.
@@ -39,6 +43,7 @@ class MoE(nn.Module):
                  hidden_size: int,
                  expert: nn.Module,
                  num_experts: int = 1,
+                 num_shared_experts: int = 0,
                  ep_size: int = 1,
                  k: int = 1,
                  capacity_factor: float = 1.0,
@@ -50,34 +55,87 @@ class MoE(nn.Module):
                  use_rts: bool = True,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
-                 top2_2nd_expert_sampling: bool = True) -> None:
+                 enable_expert_sequence_parallelism: bool = False,
+                 top2_2nd_expert_sampling: bool = True,
+                 use_uneven_all2all: bool = False,
+                 use_pft: bool = False,
+                 use_rbd: bool = False,
+                 rbd_mesh_size: int = 8,
+                 ) -> None:
 
         super(MoE, self).__init__()
 
         self.use_residual = use_residual
         self.enable_expert_tensor_parallelism = enable_expert_tensor_parallelism
+        self.enable_expert_sequence_parallelism = enable_expert_sequence_parallelism
         assert num_experts % ep_size == 0, f"Number of experts ({num_experts}) should be divisible by expert parallel size ({ep_size})"
         self.ep_size = ep_size
         self.expert_group_name = f"ep_size_{self.ep_size}"
         self.num_experts = num_experts
         self.num_local_experts = num_experts // self.ep_size
+        self.num_shared_experts = num_shared_experts
+
+        self.use_rbd = use_rbd
+        self.mesh_size = min(self.ep_size, rbd_mesh_size)
+        self.rbd_local_group_name = f"local_size_{self.mesh_size}"
 
         log_dist(
-            f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {self.ep_size}',
+            f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {self.ep_size} | num_shared_experts {self. num_shared_experts}',
             [0])
 
         assert noisy_gate_policy is None or noisy_gate_policy in ['None', 'Jitter', 'RSample'], \
             'Unsupported noisy_gate_policy: ' + noisy_gate_policy
 
-        experts = Experts(expert, self.num_local_experts, self.expert_group_name)
-        self.deepspeed_moe = MOELayer(TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
+        experts = Experts(expert, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
+
+        if use_rbd:
+            gate = TopKGateRBD(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
                                                min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
-                                               top2_2nd_expert_sampling),
+                                               top2_2nd_expert_sampling, use_rbd=True)
+        elif use_uneven_all2all:
+            gate = TopKGatev2(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
+                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
+                                               top2_2nd_expert_sampling)
+        else:
+            gate = TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
+                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
+                                               top2_2nd_expert_sampling)
+
+        if use_rbd:
+            assert use_pft and use_uneven_all2all
+
+        if use_pft:
+            assert use_uneven_all2all
+        
+        if use_tutel:
+            assert not use_uneven_all2all
+
+        if use_rbd: 
+            self.deepspeed_moe = MOEv2LayerRBD(gate,
                                       experts,
                                       self.expert_group_name,
                                       self.ep_size,
                                       self.num_local_experts,
-                                      use_tutel=use_tutel)
+                                      k=k,
+                                      use_pft=use_pft,
+                                      drop_tokens=drop_tokens)
+        elif use_uneven_all2all: 
+            # self.deepspeed_moe = UnblancedMOELayer(gate,
+            self.deepspeed_moe = MOEv2Layer(gate,
+                                      experts,
+                                      self.expert_group_name,
+                                      self.ep_size,
+                                      self.num_local_experts,
+                                      k=k,
+                                      use_pft=use_pft,
+                                      drop_tokens=drop_tokens)
+        else:
+            self.deepspeed_moe = MOELayer(gate,
+                                        experts,
+                                        self.expert_group_name,
+                                        self.ep_size,
+                                        self.num_local_experts,
+                                        use_tutel=use_tutel)
         if self.use_residual:
             self.mlp = expert
             # coefficient is used for weighted sum of the output of expert and mlp
@@ -90,17 +148,30 @@ class MoE(nn.Module):
         # Create process group for a layer if needed
         if self.expert_group_name not in groups._get_expert_parallel_group_dict():
             print(f"No existing process group found, creating a new group named: {self.expert_group_name}")
-            if (groups.mpu is None) or (not self.enable_expert_tensor_parallelism):
+            if (groups.mpu is None) or (not self.enable_expert_tensor_parallelism and not self.enable_expert_sequence_parallelism):
                 # Condition 1 - no groups.mpu means no tensor parallelism
                 # Condition 2 - disabling expert tensor parallelism on purpose
                 groups._create_expert_and_data_parallel(
                     self.ep_size, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
+            elif self.enable_expert_sequence_parallelism:
+                groups._create_expert_data_and_sequence_parallel(
+                    self.ep_size, mpu=groups.mpu, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
             else:
                 # expert tensor parallelism is enabled
                 groups._create_expert_data_and_model_parallel(
                     self.ep_size, mpu=groups.mpu, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
+            
+            if self.use_rbd:
+                groups._create_rbd_local_group(self.ep_size, self.mesh_size, mpu=groups.mpu, enable_expert_tensor_parallelism=self.enable_expert_tensor_parallelism)
+
         # Set the group handle for the MOELayer (deepspeed_moe) object
         self.deepspeed_moe._set_ep_group(groups._get_expert_parallel_group(self.expert_group_name))
+        if self.use_rbd: 
+            self.deepspeed_moe._set_local_group(groups._get_rbd_local_group(self.rbd_local_group_name))
+            self.deepspeed_moe._set_rbd()
+
+
+
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -120,7 +191,16 @@ class MoE(nn.Module):
 
             * exp_counts (Tensor): expert count
         """
+        
+        # torch.cuda.memory._record_memory_history(
+        #     max_entries=100000
+        # )
+        # see_memory_usage("before MoE", force=SEE_MEMORY) 
+
         output = self.deepspeed_moe(hidden_states, used_token)
+        # see_memory_usage("after MoE", force=SEE_MEMORY) 
+        # torch.cuda.memory._dump_snapshot("/lustre/orion/gen150/scratch/pinaster/moe-arch/system-benchmark/deepseek-style/profile/moe-layer.pickle")
+        # torch.cuda.memory._record_memory_history(enabled=None)
         if self.use_residual:
             # Residual MoE
             output_mlp = self.mlp(hidden_states)

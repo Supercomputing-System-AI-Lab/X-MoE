@@ -80,62 +80,70 @@ class MoE(nn.Module):
         self.rbd_local_group_name = f"local_size_{self.mesh_size}"
 
         log_dist(
-            f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {self.ep_size} | num_shared_experts {self. num_shared_experts}',
+            f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {self.ep_size} | num_shared_experts {self.num_shared_experts}',
             [0])
 
         assert noisy_gate_policy is None or noisy_gate_policy in ['None', 'Jitter', 'RSample'], \
             'Unsupported noisy_gate_policy: ' + noisy_gate_policy
 
+        if use_rbd:
+            assert use_pft and use_uneven_all2all, "RBD requires PFT and uneven all2all"
+        if use_pft:
+            assert use_uneven_all2all, "PFT requires uneven all2all"
+        if use_tutel:
+            assert not use_uneven_all2all, "Tutel is incompatible with uneven all2all"
+
         experts = Experts(expert, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
 
+        gate_params = {
+            "model_dim": hidden_size,
+            "num_experts": num_experts,
+            "k": k,
+            "capacity_factor": capacity_factor, 
+            "eval_capacity_factor": eval_capacity_factor,
+            "min_capacity": min_capacity,
+            "noisy_gate_policy": noisy_gate_policy,
+            "drop_tokens": drop_tokens,
+            "use_rts": use_rts,
+            "ep_group": None,
+            "top2_2nd_expert_sampling": top2_2nd_expert_sampling
+        }
+
         if use_rbd:
-            gate = TopKGateRBD(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
-                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
-                                               top2_2nd_expert_sampling, use_rbd=True)
+            gate = TopKGateRBD(**gate_params, use_rbd=True)
         elif use_uneven_all2all:
-            gate = TopKGatev2(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
-                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
-                                               top2_2nd_expert_sampling)
+            gate = TopKGatev2(**gate_params)
         else:
-            gate = TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
-                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, None,
-                                               top2_2nd_expert_sampling)
+            gate = TopKGate(**gate_params, use_uneven_all2all=use_uneven_all2all)
+
+        moe_layer_params = {
+            "gate": gate,
+            "experts": experts,
+            "ep_group_name": self.expert_group_name,
+            "ep_size": self.ep_size,
+            "num_local_experts": self.num_local_experts
+        }
 
         if use_rbd:
-            assert use_pft and use_uneven_all2all
-
-        if use_pft:
-            assert use_uneven_all2all
-        
-        if use_tutel:
-            assert not use_uneven_all2all
-
-        if use_rbd: 
-            self.deepspeed_moe = MOEv2LayerRBD(gate,
-                                      experts,
-                                      self.expert_group_name,
-                                      self.ep_size,
-                                      self.num_local_experts,
-                                      k=k,
-                                      use_pft=use_pft,
-                                      drop_tokens=drop_tokens)
-        elif use_uneven_all2all: 
-            # self.deepspeed_moe = UnblancedMOELayer(gate,
-            self.deepspeed_moe = MOEv2Layer(gate,
-                                      experts,
-                                      self.expert_group_name,
-                                      self.ep_size,
-                                      self.num_local_experts,
-                                      k=k,
-                                      use_pft=use_pft,
-                                      drop_tokens=drop_tokens)
+            self.deepspeed_moe = MOEv2LayerRBD(
+                **moe_layer_params,
+                k=k,
+                use_pft=use_pft,
+                drop_tokens=drop_tokens
+            )
+        elif use_uneven_all2all:
+            self.deepspeed_moe = MOEv2Layer(
+                **moe_layer_params,
+                k=k,
+                use_pft=use_pft,
+                drop_tokens=drop_tokens
+            )
         else:
-            self.deepspeed_moe = MOELayer(gate,
-                                        experts,
-                                        self.expert_group_name,
-                                        self.ep_size,
-                                        self.num_local_experts,
-                                        use_tutel=use_tutel)
+            self.deepspeed_moe = MOELayer(
+                **moe_layer_params,
+                use_tutel=use_tutel
+            )
+
         if self.use_residual:
             self.mlp = expert
             # coefficient is used for weighted sum of the output of expert and mlp
@@ -169,8 +177,6 @@ class MoE(nn.Module):
         if self.use_rbd: 
             self.deepspeed_moe._set_local_group(groups._get_rbd_local_group(self.rbd_local_group_name))
             self.deepspeed_moe._set_rbd()
-
-
 
 
     def forward(self,

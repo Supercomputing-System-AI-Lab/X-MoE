@@ -280,7 +280,7 @@ class MOEv2LayerRBD(Base):
         tokens_per_experts_s2_exp = metadata[-1]
 
         splits = tokens_per_expert_s1_exp.view(-1, self.num_local_experts).sum(dim=0) + tokens_per_experts_s2_exp.view(-1, self.num_local_experts).sum(dim=0)
-        splits = splits.tolist()
+        # splits = splits.tolist()
 
         assert sum(splits) == dx_exp.shape[0], "sum of local splits != dispatched output shape"
 

@@ -45,122 +45,6 @@ DISPATCH_TIMER = 'dispatch_gemm'
 COMBINE_TIMER = 'combine_gemm'
 EXPERTS_TIMER = 'experts'
 
-# class _AllToAllSingle(torch.autograd.Function):
-
-#     @staticmethod
-#     def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor, input_splits: list, output_splits: list, debug_timing: bool = False) -> Tensor:  # type: ignore
-
-#         ctx.group = group
-#         ctx.input_splits = input_splits
-#         ctx.output_splits = output_splits
-
-#         if debug_timing:
-#             import time
-#             torch.cuda.synchronize()
-#             dist.barrier()
-#             st = time.time()
-
-#         input = input.contiguous()
-#         total_recv = sum(output_splits)
-#         if len(input.shape) == 1:
-#             output = torch.empty([total_recv], device=input.device, dtype=input.dtype)
-#         else:
-#             output = torch.empty(total_recv, input.shape[-1], device=input.device, dtype=input.dtype)
-
-#         if debug_timing:
-#             torch.cuda.synchronize()
-#             dist.barrier()
-#             layout_time = time.time() - st
-
-#         world_size = dist.get_world_size()
-#         rank = dist.get_rank() % dist.get_world_size(group)
-
-#         input_splits_0_flag = False
-#         output_splits_0_flag = False
-
-
-#         # dist.barrier()
-#         # print(f"{rank}: {input.shape}", flush=True)
-#         # print(f"{rank}: {output.shape}", flush=True)
-#         # dist.barrier()
-
-#         if sum(input_splits) == 0:
-#             # print("!!! detect all 0 input", flush=True)
-#             if len(input.shape) == 1: 
-#                 input = torch.zeros([1], device='cuda', dtype=input.dtype)
-#             else:
-#                 input = torch.zeros((1, input.shape[-1]), device='cuda', dtype=input.dtype)
-#             temp_input_splits = input_splits.copy()
-#             temp_output_splits = output_splits.copy()
-#             temp_input_splits[rank] = 1
-#             temp_output_splits[rank] = 1
-            
-#             if len(input.shape) == 1: 
-#                 extra_zeros = torch.zeros([1], device='cuda', dtype=output.dtype)
-#             else:
-#                 extra_zeros = torch.zeros((1, output.shape[-1]), device='cuda', dtype=output.dtype)
-#             output = torch.cat([output, extra_zeros], dim=0)
-
-#             _position = sum(output_splits[:rank])
-#             input_splits_0_flag = True
-        
-#         if sum(output_splits) == 0:
-#             # print("!!! detect all 0 output", flush=True)
-#             _output = output
-#             temp_input_splits = input_splits.copy()
-#             temp_output_splits = output_splits.copy()
-#             temp_input_splits[rank] = 1
-#             temp_output_splits[rank] = 1
-
-#             if len(input.shape) == 1: 
-#                 extra_zeros = torch.zeros([1], device='cuda', dtype=output.dtype)
-#             else:
-#                 extra_zeros = torch.zeros((1, output.shape[-1]), device='cuda', dtype=output.dtype)
-#             _position = sum(input_splits[:rank])
-#             input = torch.cat((input[:_position], extra_zeros, input[_position:]), dim=0)
-#             if len(input.shape) == 1: 
-#                 output = torch.zeros([1], device='cuda', dtype=input.dtype)
-#             else:
-#                 output = torch.zeros((1, input.shape[-1]), device='cuda', dtype=input.dtype)
-#             output_splits_0_flag = True
-
-#         # dist.barrier()
-#         # print(f"{rank}: input {input.shape}", flush=True)
-#         # print(f"{rank}: output {output.shape}", flush=True)
-#         # dist.barrier()
-
-#         if debug_timing:
-#             torch.cuda.synchronize()
-#             dist.barrier()
-#             st = time.time()
-
-
-#         if input_splits_0_flag or output_splits_0_flag:
-#             dist.all_to_all_single(output, input, output_split_sizes=temp_output_splits, input_split_sizes=temp_input_splits, group=group)
-#         else:
-#             dist.all_to_all_single(output, input, output_split_sizes=output_splits, input_split_sizes=input_splits, group=group)
-
-#         if debug_timing:
-#             torch.cuda.synchronize()
-#             dist.barrier()
-#             comm_time = time.time() - st
-#             if rank == 0:
-#                 print(f"----layout time: {layout_time}", flush=True)
-#                 print(f"----comm time: {comm_time}", flush=True)
-
-#         if input_splits_0_flag:
-#             output = torch.cat((output[:_position], output[_position+1:]), dim=0)
-
-        
-#         if output_splits_0_flag:
-#             output = _output
-
-#         return output
-
-#     @staticmethod
-#     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor]:
-#         return (None, _AllToAllSingle.apply(ctx.group, *grad_output, ctx.output_splits, ctx.input_splits), None, None, None)
-
 def topkgating_unbalanced(
     logits: Tensor,
     k: int,
@@ -338,15 +222,12 @@ class MOEv2Layer(Base):
             torch.distributed.barrier()
             self.timers(MOE_TIMER).start()
 
-        # Implement Algorithm 2 from GShard paper.
         d_model = input[0].shape[-1]
-
-        # Initial implementation -> Reshape into S tokens by dropping sequence dimension.
-        # Reshape into G groups so that each group can distribute tokens equally
-        # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
 
         tensor_model_world_size = bwc_tensor_model_parallel_world_size(groups.mpu)
+
+        # sequence-sharded MoE block: drop tokens at the beginning of the sparse MoE layer.
         if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
             orig_shape = reshaped_input.shape
             reshaped_input = drop_tokens(reshaped_input, dim=0)
@@ -355,7 +236,6 @@ class MOEv2Layer(Base):
         n_tokens = reshaped_input.shape[0]
 
         if self.use_pft:
-            # print(f"rank [{dist.get_rank()}]: before megablocks gating", flush=True)
             self.l_aux, indices, bin_ids, bins, expert_weights, input_splits_tensor = self.gate(reshaped_input, use_pft=True)
            
             if self.wall_clock_breakdown:
@@ -373,7 +253,6 @@ class MOEv2Layer(Base):
                 self.time_dispatch = self.timers(DISPATCH_TIMER).elapsed(reset=False)
 
             self.exp_counts = input_splits_tensor
-
         else:
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
             if self.wall_clock_breakdown:
@@ -396,36 +275,27 @@ class MOEv2Layer(Base):
         input_splits = input_splits_tensor_ep.tolist()
         output_splits = output_splits_tensor_ep.tolist()
 
-
         assert sum(input_splits) == flattened_input.shape[0], f"input_split sum {sum(input_splits)} != input shape [0] {flattened_input.shape[0]} on rank {dist.get_rank()}"
 
         if self.wall_clock_breakdown:
             torch.distributed.barrier()
             self.timers(FIRST_ALLTOALL_TIMER).start()
 
+        # dispatch all-to-all
         dispatched_output = _AllToAllSingle.apply(self.ep_group, flattened_input, input_splits, output_splits)
-
-        # if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() > 1:
-        #     dispatched_input = drop_tokens(dispatched_input, dim=1)
 
         if self.wall_clock_breakdown:
             torch.distributed.barrier()
             self.timers(FIRST_ALLTOALL_TIMER).stop()
             self.time_falltoall = self.timers(FIRST_ALLTOALL_TIMER).elapsed(reset=False)
 
-        # if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() > 1:
-        #     dispatched_input = gather_tokens(dispatched_input, dim=1)
 
         # splits = output_splits_tensor.view(-1, self.num_local_experts).sum(dim=0).tolist() 
         # assert sum(splits) == dispatched_output.shape[0], "sum of local splits != dispatched output shape"
-
-        # print(f"{splits}")
-        # print(f"{output_splits_tensor}")
         
         if self.wall_clock_breakdown:
             torch.distributed.barrier()
             self.timers(EXPERTS_TIMER).start()
-
 
         #%%%%%%
         # expert_output_uneven = self.experts(dispatched_output, splits)
@@ -446,6 +316,7 @@ class MOEv2Layer(Base):
             for idx in range(K)
         ], dim=0)
 
+        # combine all-to-all
         expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
         ##################
 
@@ -453,15 +324,6 @@ class MOEv2Layer(Base):
             torch.distributed.barrier()
             self.timers(EXPERTS_TIMER).stop()
             self.time_experts = self.timers(EXPERTS_TIMER).elapsed(reset=False)
-
-        # if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() > 1:
-        #     # if both expert and non-expert are tensor-parallel
-        #     # drop duplicate tokens to ensure both correctness
-        #     # and reduce all-to-all communication.
-        #     expert_output = drop_tokens(expert_output, dim=1)
-
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
             self.timers(SECOND_ALLTOALL_TIMER).start()
 
         #%%%%%%
@@ -477,12 +339,6 @@ class MOEv2Layer(Base):
             expert_output = expert_output_uneven
         else:
             expert_output = restore_zero_rows(expert_output_uneven, padding_mask)
-
-        # if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() > 1:
-        #     # the dropped duplicate tokens need to be gathered on each
-        #     # tensor parallel rank again for the tensor-parallel
-        #     # non-expert of the next layer.
-        #     expert_output = gather_tokens(expert_output, dim=1)
 
         if self.wall_clock_breakdown:
             torch.distributed.barrier()
@@ -502,10 +358,8 @@ class MOEv2Layer(Base):
             self.timers(COMBINE_TIMER).stop()
             self.time_combine = self.timers(COMBINE_TIMER).elapsed(reset=False)
 
+        # sequence-sharded MoE block: gather tokens at the end of the sparse MoE layer.
         if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
-            # the dropped duplicate tokens need to be gathered on each
-            # tensor parallel rank again for the tensor-parallel
-            # non-expert of the next layer.
             combined_output = gather_tokens(combined_output, dim=0)
             assert combined_output.shape == orig_shape
 

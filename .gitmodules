@@ -1,0 +1,3 @@
+[submodule "Megatron-DeepSpeed-X-MoE"]
+	path = Megatron-DeepSpeed-X-MoE
+	url = https://github.com/yueming-yuan/Megatron-DeepSpeed-X-MoE

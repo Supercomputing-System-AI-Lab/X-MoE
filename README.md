@@ -1,3 +1,55 @@
+
+# X-MoE: Cross-Platform Training Framework for Expert-Specialized MoE
+X-MoE is an optimized framework for training large-scale expert-specialized Mixture-of-Experts (MoE) models (e.g. DeepSeek-MoE style). It introduces system-level enhancements for improved throughput and memory efficiency. This project is built on top of DeepSpeed and integrates with Megatron-DeepSpeed for end-to-end MoE training.
+
+For more details on the optimizations and experiments, refer to our paper and the project page: https://supercomputing-system-ai-lab.github.io/projects/x-moe/.
+
+
+
+## Usage
+
+**IMPORTANT for Artifact Evaluation: This is a general guide. For detailed installation guide on Artifact Evaluation, please refer to the AE document.**
+
+
+
+### Installing X-MoE
+Clone repository:
+```bash
+cd ~
+git clone https://github.com/Supercomputing-System-AI-Lab/X-MoE
+cd X-MoE
+git submodule update --init --recursive --remote
+```
+Install dependencies:
+```bash
+# For NVIDIA GPUs:
+./scripts/install_dep_cuda.sh
+
+# For AMD GPUs:
+./scripts/install_dep_rocm.sh
+```
+
+Install X-MoE:
+```bash
+pip install -e .
+cd Megatron-DeepSpeed-X-MoE && pip install -e .
+```
+
+### Running Training with X-MoE
+Prepare data:
+```bash
+cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/data
+./prepare_data_ae.sh
+```
+
+Running Training with X-MoE:
+```bash
+cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts
+./X-MoE-Small-node-1.sh <NUM_GPUS> <MICRO_BATCH_SIZE>
+```
+------
+
+
 [![License Apache 2.0](https://badgen.net/badge/license/apache2.0/blue)](https://github.com/Microsoft/DeepSpeed/blob/master/LICENSE)
 [![PyPI version](https://badge.fury.io/py/deepspeed.svg)](https://pypi.org/project/deepspeed/)
 [![Downloads](https://static.pepy.tech/badge/deepspeed)](https://pepy.tech/project/deepspeed)

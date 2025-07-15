@@ -15,11 +15,9 @@
  2025-06-26: X-MoE has been accepted at SC 2025 and received Best Student Paper Nomination.
 
 ## About
-X-MoE is an optimized cross-platform framework for training large-scale expert-specialized Mixture-of-Experts (MoE) models (e.g. DeepSeek-MoE style). It introduces system-level enhancements for improved throughput and memory efficiency. This project is built on top of DeepSpeed and integrates with Megatron-DeepSpeed for end-to-end MoE training.
+X-MoE is an optimized cross-platform framework for training large-scale expert-specialized Mixture-of-Experts (MoE) models (e.g. DeepSeek-MoE style). It introduces system-level enhancements for improved end-to-end throughput and memory efficiency. This project is built on top of DeepSpeed and Megatron-DeepSpeed.
 
 
-
-For more details on the optimizations and experiments, refer to our paper and the project page: https://supercomputing-system-ai-lab.github.io/projects/x-moe/.
 
 ## Features
 **Padding-free MoE training pipeline with cross-platform support (PFT)**\

@@ -5,8 +5,14 @@
   <img src="images/xmoe-overview.jpg" alt="X-MoE Overview" width="600"/>
 </p>
 
+<!-- [![](https://img.shields.io/badge/Paper-PDF-blue)](https://arxiv.org/abs/2506.20686) -->
+[![](https://img.shields.io/badge/project-page-purple)](https://supercomputing-system-ai-lab.github.io/projects/x-moe/)
+![](https://img.shields.io/badge/NVIDIA-support-green?style=flat&logo=nvidia&logoColor=green)
+![](https://img.shields.io/badge/AMD-support-red?style=flat&logo=amd&logoColor=black&labelColor=white)
+
 ## News
- 2025-06-26: X-MoE has been accepted at SC 2025 and received Best Student Paper Nomination!
+ 2025-07-14: X-MoE's code released. \
+ 2025-06-26: X-MoE has been accepted at SC 2025 and received Best Student Paper Nomination.
 
 ## About
 X-MoE is an optimized cross-platform framework for training large-scale expert-specialized Mixture-of-Experts (MoE) models (e.g. DeepSeek-MoE style). It introduces system-level enhancements for improved throughput and memory efficiency. This project is built on top of DeepSpeed and integrates with Megatron-DeepSpeed for end-to-end MoE training.
@@ -15,6 +21,15 @@ X-MoE is an optimized cross-platform framework for training large-scale expert-s
 
 For more details on the optimizations and experiments, refer to our paper and the project page: https://supercomputing-system-ai-lab.github.io/projects/x-moe/.
 
+## Features
+**Padding-free MoE training pipeline with cross-platform support (PFT)**\
+X-MoE introduces PFT (Padding-Free Token buffers), eliminates zero-padding through MoE computation and communication stages. Cross-platform Triton-based kernels handle sparse and irregular workloads efficiently.
+
+**Redundancy-Bypassing Dispatch (RBD)**\
+A hierarchical multi-stage dispatching process that eliminates redundant inter-node communication by using pilot tokens and local replicas, reducing communication overhead on repeated tokens.
+
+**Sequence-Sharded MoE Blocks (SSMB)**\
+A hybrid parallelism strategy that combines tensor-slicing with sequence-sharded execution for MoE blocks, reducing activation memory by a factor of the TP group size while maintaining compatibility with standard MoE routing.
 
 ## Quick Start
 
@@ -23,23 +38,24 @@ For more details on the optimizations and experiments, refer to our paper and th
 
 
 ### Installing X-MoE
-Clone repository:
+**Clone repository**
 ```bash
 cd ~
 git clone https://github.com/Supercomputing-System-AI-Lab/X-MoE
 cd X-MoE
 git submodule update --init --recursive --remote
 ```
-Install dependencies:
+**Install dependencies**\
+To run X-MoE with Megatron-DeepSpeed framework, Apex and FlashAttention is required. You can install the dependencies by running the following scripts.
 ```bash
 # For NVIDIA GPUs:
 ./scripts/install_dep_cuda.sh
 
-# For AMD GPUs:
+# For AMD GPUs
 ./scripts/install_dep_rocm.sh
 ```
 
-Install X-MoE:
+**Install X-MoE**
 ```bash
 pip install -e .
 cd Megatron-DeepSpeed-X-MoE && pip install -e .

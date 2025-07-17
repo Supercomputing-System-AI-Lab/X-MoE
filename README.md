@@ -31,8 +31,6 @@ A hybrid parallelism strategy that combines tensor-slicing with sequence-sharded
 
 ## Quick Start
 
-**IMPORTANT for Artifact Evaluation: This is a general guide. For detailed installation & execution guide on Artifact Evaluation, please refer to the AE document.**
-
 
 
 ### Installing X-MoE

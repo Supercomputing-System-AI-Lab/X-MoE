@@ -141,6 +141,11 @@ cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts-frontier
 ./n8-Small-XMoE.slurm
 ```
 
+> **Note**: The first run may require an additional 10 minutes to compile kernels.
+
+**Expectation**:
+After initialization, you can see the training logs during training progress in the terminal. The training logs will also be saved as a log file. When using one computing node on Frontier (4*MI250X GPUs), the expected throughput is ~50-55 TFLOPs with X-MoE optimizations.
+
 ### ⚙️ How to Enable X-MoE Optimizations?
 
 #### Basic Optimizations

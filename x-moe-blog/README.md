@@ -19,7 +19,7 @@ Most existing efforts to train these expert-specialized MoEs have focused on NVI
 
 - **Extremely low throughput**. When we did manage to make training run by reducing model depth, we observed that both DeepSpeed-MoE and Tutel achieved <10 TFLOPs per GPU on MI250X, which is less than 10% of peak performance. We also experimented with Megablocks, but it often hung beyond a single node, and in practice also delivered very low throughput (again, <10 TFLOPs).
  
-## What broke: What makes it so hard to train DeepSeek-style MoE on Frontier?
+## What makes it so hard to train DeepSeek-style MoE on Frontier?
 
 #### 1) The activation memory becomes significant.
 DeepSeek-style MoEs increase top-k and shrink expert FFN hidden sizes. That keeps parameters and per-token FLOPs roughly constant but moves the activation bottleneck into the dispatch and combine tensors, which now grow with the fine-grained factor m (i.e., with top-k).
@@ -56,7 +56,7 @@ One issue is caused by the **token duplication**: With large k, MoE's token rout
 
 
 
-## What we fixed: What X-MoE changes
+## What X-MoE changes
 
 X-MoE is an end-to-end training stack with three concrete system pieces that directly target the above failure modes:
 

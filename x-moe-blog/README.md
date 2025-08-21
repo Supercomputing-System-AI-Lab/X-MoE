@@ -9,7 +9,7 @@ At a glance, X-MoE scales DeepSeek-style models to **545B parameters on 1,024 GP
   <img src="imgs/xmoe-overview.jpg" alt="X-MoE Overview" width="80%">
 </p>
 
-## Expert-specialized MoEs training practice on Frontier
+## Beginning: Expert-specialized MoEs training experience on Frontier
 
 DeepSeek-style MoE architectures emphasize expert specialization: they use a large number of fine-grained experts and route each token to multiple experts with a high top-k (e.g., 256 experts with k=8 in DeepSeek-v3). This design improves model quality per FLOP, but it also shifts what dominates the systems cost of training.
 
@@ -19,7 +19,7 @@ Most existing efforts to train these expert-specialized MoEs have focused on NVI
 
 - **Extremely low throughput**. When we did manage to make training run by reducing model depth, we observed that both DeepSpeed-MoE and Tutel achieved <10 TFLOPs per GPU on MI250X, which is less than 10% of peak performance. We also experimented with Megablocks, but it often hung beyond a single node, and in practice also delivered very low throughput (again, <10 TFLOPs).
  
-## What make it so hard to train DeepSeek-style MoE on Frontier?
+## What broke: What makes it so hard to train DeepSeek-style MoE on Frontier?
 
 #### 1) The activation memory becomes significant.
 DeepSeek-style MoEs increase top-k and shrink expert FFN hidden sizes. That keeps parameters and per-token FLOPs roughly constant but moves the activation bottleneck into the dispatch and combine tensors, which now grow with the fine-grained factor m (i.e., with top-k).
@@ -56,7 +56,7 @@ One issue is caused by the **token duplication**: With large k, MoE's token rout
 
 
 
-## What X-MoE changes
+## What we fixed: What X-MoE changes
 
 X-MoE is an end-to-end training stack with three concrete system pieces that directly target the above failure modes:
 
@@ -98,7 +98,7 @@ X-MoE delivers better training efficiency that SOTA frameworks on Frontier: On 2
   <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="70%">
 </p>
 
-## Training recipes/observations on ROCm devices
+## What to learn: Training recipes/observations on ROCm devices
 We also want to share some practical lessons and solutions we learned while training on Frontier, which may serve as useful references for scaling model training on ROCm-based devices.
 
 1. **ROCm GEMM performance.**

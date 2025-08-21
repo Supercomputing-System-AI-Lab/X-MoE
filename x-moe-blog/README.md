@@ -26,7 +26,7 @@ Most existing efforts to train these expert-specialized MoEs have focused on NVI
 DeepSeek-style MoEs increase top-k and shrink expert FFN hidden sizes. That keeps parameters and per-token FLOPs roughly constant but moves the activation bottleneck into the dispatch and combine tensors, which now grow with the fine-grained factor m (i.e., with top-k).
 
 To be more intuitive, the table below shows the sizes of the 4 dominative activation tensors in the MoE block, where $M_{conv}$ means conventional MoE model $M_{spec}$ means expert-specialized MoE model.
-<p style="text-align: center;">
+<p align="center">
   <img src="imgs/activation_memory_table.jpg" alt="X-MoE Overview" width="50%">
 </p>
 
@@ -80,7 +80,7 @@ To make this fast across vendors, we implement **Triton gather/scatter kernels**
 We restructure dispatch into two stages that respect Frontier’s hierarchy. We send only **pilot tokens** across nodes, one representative for each “(source node, destination node)” group, and materialize **local replicas** for same-node duplicate experts using fast intra-node links. This bypasses redundant inter-node copies while preserving correctness.
 
 In the unit test, RBD reduces inter-node all-to-all time by **52.5%** at a EP=32 configuration, yielding an overall **1.55× dispatch speedup**.
-<p style="text-align: center;">
+<p align="center">
   <img src="imgs/rbd_results.jpg" alt="X-MoE Overview" width="50%">
 </p>
 
@@ -95,7 +95,7 @@ SSMB lowers peak memory increasingly as TP grows, and—unlike activation checkp
 
 ## End-to-end results on Frontier
 X-MoE delivers better training efficiency that SOTA frameworks on Frontier: On 256 GPUs, DeepSpeed-MoE/TED/Tutel OOM on 201B-parameter “Large”, while X-MoE trains it; on 55.2B “Medium”, X-MoE is 5.15× faster than DeepSpeed-TED and 1.42× faster than Tutel. 
-<p style="text-align: center;">
+<p align="center">
   <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="80%">
 </p>
 

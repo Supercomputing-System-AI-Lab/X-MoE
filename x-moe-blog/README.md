@@ -115,3 +115,16 @@ At very large scales, the dominant bottleneck becomes all-to-all stragglers. We 
 ## Repro details
 
 We used PyTorch 2.2.0, ROCm 5.7.1, DeepSpeed 0.15.5, RCCL + AWS-OFI-RCCL (libfabric 1.20.1), and standard env tuning for Frontier. MI250X peak is ~191.5 TFLOPS per GCD (effective GPU). 
+
+## Citation
+```
+@misc{yuan2025xmoeenablingscalabletraining,
+      title={X-MoE: Enabling Scalable Training for Emerging Mixture-of-Experts Architectures on HPC Platforms}, 
+      author={Yueming Yuan and Ahan Gupta and Jianping Li and Sajal Dash and Feiyi Wang and Minjia Zhang},
+      year={2025},
+      eprint={2508.13337},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2508.13337}, 
+}
+```

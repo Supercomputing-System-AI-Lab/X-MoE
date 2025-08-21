@@ -37,7 +37,6 @@ Conventional pipelines build dense dispatch masks and **fixed-capacity expert bu
 Frontier’s network is hierarchical and asymmetric: Within a node, MI250X GPUs communicate over Infinity Fabric (~200 GB/s); across nodes, Slingshot links are ~25 GB/s. In our experiments, all-to-all communication (domincated by interconnection) usually take more than 50% of training time when training an expert-specialized MoE model on 64 GPUs. As a comparison, for conventional MoEs at same scale, the communication only takes ~10% time.
 
 One issue is caused by the **token duplication**: With large k, MoE's token routing duplicates traffic. if several of a token’s experts live on the same remote node, existing systems send multiple copies of the same activation across the slow link. Existing systems treat all GPUs the same, so tokens get duplicated across inter-node links when multiple selected experts live on the same destination node. 
-> Extra observations: At larger scales, Frontier’s all-to-all latency also spikes beyond 256 GPUs, with frequent outliers >500 ms, which is likely caused by cross-rack traffic. 
 
 
 

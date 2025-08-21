@@ -96,7 +96,7 @@ SSMB lowers peak memory increasingly as TP grows, and—unlike activation checkp
 ## End-to-end results on Frontier
 X-MoE delivers better training efficiency that SOTA frameworks on Frontier: On 256 GPUs, DeepSpeed-MoE/TED/Tutel OOM on 201B-parameter “Large”, while X-MoE trains it; on 55.2B “Medium”, X-MoE is 5.15× faster than DeepSpeed-TED and 1.42× faster than Tutel. 
 <p align="center">
-  <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="80%">
+  <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="70%">
 </p>
 
 ## Repro details

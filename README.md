@@ -190,6 +190,14 @@ Our evaluation on the **Frontier supercomputer** demonstrates that X-MoE enables
 </p>
 
 ## 📝 Citation
-
-Coming soon...
-
+```
+@misc{yuan2025xmoeenablingscalabletraining,
+      title={X-MoE: Enabling Scalable Training for Emerging Mixture-of-Experts Architectures on HPC Platforms}, 
+      author={Yueming Yuan and Ahan Gupta and Jianping Li and Sajal Dash and Feiyi Wang and Minjia Zhang},
+      year={2025},
+      eprint={2508.13337},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2508.13337}, 
+}
+```

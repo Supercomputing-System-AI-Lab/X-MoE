@@ -1,5 +1,4 @@
 
-前言
 # X-MoE: Scaling DeepSeek-style MoEs on Frontier—training practice, what limited and what we fixed
 
 When we first tried to train DeepSeek-style MoEs on Frontier (AMD MI250X + Dragonfly/Slingshot), two things derailed us immediately: training ran out of memory, and even when it didn’t, it crawled. Off-the-shelf stacks that work fine on NVIDIA DGX clusters were leaving huge performance on the table on Frontier. This post is our “why” and “how” behind X-MoE, our system that makes those models trainable and fast on non-NVIDIA HPC platforms.

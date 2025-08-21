@@ -91,14 +91,14 @@ SSMB lowers peak memory increasingly as TP grows, and—unlike activation checkp
 </p>
 <sub>^ Left: memory saving; Right: SSMB vs. activation checkpointing</sub>
 
-## End-to-end results on Frontier
+### End-to-end results on Frontier
 X-MoE delivers better training efficiency that SOTA frameworks on Frontier: On 256 GPUs, DeepSpeed-MoE/TED/Tutel OOM on 201B-parameter “Large”, while X-MoE trains it; on 55.2B “Medium”, X-MoE is 5.15× faster than DeepSpeed-TED and 1.42× faster than Tutel. 
 <p align="center">
   <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="70%">
 </p>
 
-## What to learn: Training recipes/observations on ROCm devices
-We also want to share some practical lessons and solutions we learned while training on Frontier, which may serve as useful references for scaling model training on ROCm-based devices.
+## Additional training recipes/observations on ROCm devices
+We also want to share some extra information: the practical lessons and solutions we learned while training on Frontier, which may serve as useful references for scaling model training on ROCm-based devices.
 
 1. **ROCm GEMM performance.**
 On a single node, the primary bottleneck is the efficiency of GEMM operations in rocBLAS. Compared to CUDA devices, it’s harder to approach the same percentage of peak TFLOPs. For example, while GEMM can theoretically reach >80% of peak TFLOPs on NVIDIA GPUs, we observed only ~60% under the same settings on MI250X. To improve efficiency, it’s often worthwhile to tune the matrix dimensions of the model specifically for ROCm devices.

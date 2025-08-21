@@ -1,5 +1,5 @@
 
-# X-MoE: Scaling DeepSeek-style MoEs on Frontier—training practice, what limited and what we fixed
+# X-MoE: Scaling DeepSeek-style MoEs on Frontier—what broke, what we fixed, and what to learn
 
 When we first tried to train DeepSeek-style MoEs on Frontier (AMD MI250X + Dragonfly/Slingshot), two things derailed us immediately: training ran out of memory, and even when it didn’t, it crawled. Off-the-shelf stacks that work fine on NVIDIA DGX clusters were leaving huge performance on the table on Frontier. This post is our “why” and “how” behind X-MoE, our system that makes those models trainable and fast on non-NVIDIA HPC platforms.
 
@@ -76,7 +76,7 @@ To make this fast across vendors, we implement **Triton gather/scatter kernels**
 <sub>^ Comparison of X-MoE and DeepSpeed-MoE, with only PFT optimization enabled</sub>
 
 #### 2) **Redundancy-Bypassing Dispatch (RBD)**
-We restructure dispatch into two stages that respect Frontier’s hierarchy. We send only **pilot tokens** across nodes, one representative for each “(source node, destination node)” group, and materialize **local replicas** for same-node duplicate experts using fast intra-node links. This bypasses redundant inter-node copies while preserving correctness.
+We restructure dispatch into two stages that respect Frontier’s hierarchy. We send only **pilot tokens** across nodes, one representative for each “(source node, destination node)” group, and materialize **local replicas** for same-node duplicate experts using fast intra-node links. This bypasses redundant inter-node copies while preserving correctness. This communication implementation uses NCCL/RCCL as backends.
 
 In the unit test, RBD reduces inter-node all-to-all time by **52.5%** at a EP=32 configuration, yielding an overall **1.55× dispatch speedup**.
 <p align="center">
@@ -96,6 +96,21 @@ SSMB lowers peak memory increasingly as TP grows, and—unlike activation checkp
 X-MoE delivers better training efficiency that SOTA frameworks on Frontier: On 256 GPUs, DeepSpeed-MoE/TED/Tutel OOM on 201B-parameter “Large”, while X-MoE trains it; on 55.2B “Medium”, X-MoE is 5.15× faster than DeepSpeed-TED and 1.42× faster than Tutel. 
 <p align="center">
   <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="70%">
+</p>
+
+## Training recipes/observations on ROCm devices
+We also want to share some practical lessons and solutions we learned while training on Frontier, which may serve as useful references for scaling model training on ROCm-based devices.
+
+1. **ROCm GEMM performance.**
+On a single node, the primary bottleneck is the efficiency of GEMM operations in rocBLAS. Compared to CUDA devices, it’s harder to approach the same percentage of peak TFLOPs. For example, while GEMM can theoretically reach >80% of peak TFLOPs on NVIDIA GPUs, we observed only ~60% under the same settings on MI250X. To improve efficiency, it’s often worthwhile to tune the matrix dimensions of the model specifically for ROCm devices.
+
+2. **RCCL hang issue in multi-node training.**
+When scaling to multiple nodes, we encountered bugs in RCCL while training expert-specialized MoEs. Training would occasionally hang during iterations 5–100, an issue we saw both with Megablocks and while developing X-MoE. The root cause appears to be a buggy behavior in RCCL: if one device receives zero tokens during an all-to-all exchange, the system can deadlock. While this is rare in conventional MoEs with a small number of experts, it becomes much more common in expert-specialized MoEs. As a quick workaround, we added a dummy token that each device sends to itself whenever it would otherwise receive none.
+
+3. **Sragglers in large-scale training (>256 GPUs).**
+At very large scales, the dominant bottleneck becomes all-to-all stragglers. We believe this stems from traffic congestion caused by frequent, overlapping DP all-reduces and EP all-to-all communications. As the number of GPUs grows beyond 2,048, these stragglers can account for more than 50% of the total training overhead. The problem arises because different EP groups must wait for each other at synchronization points after forward/backward passes, so even though straggler events are relatively infrequent, their impact on overall throughput is significant. The figure below shows our benchmarking results highlighting these straggler behaviors.
+<p align="center">
+  <img src="imgs/stragglers.jpg" alt="X-MoE Overview" width="45%">
 </p>
 
 ## Repro details

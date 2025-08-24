@@ -60,9 +60,9 @@ One issue is caused by the **token duplication**: With large k, MoE's token rout
 X-MoE is an end-to-end training stack with three concrete system pieces that directly target the above failure modes:
 
 #### 1) A truly padding-free MoE pipeline with cross-platform kernels
-We introduce **PFT (Padding-Free Token) buffers**: instead of fixed [E, C, H] expert buffers and a [S, E, C] dispatch mask, PFT stores only routed tokens (with dropped ones removed) plus a compact set of ERI-arrays—`token_ids`, `expert_ids`, `tokens_per_expert`, and `combine_weights`. The MoE stages (gating → dispatch → expert MLP → combine) are rewritten to run on PFT, with the all-to-alls now uneven and free of zero padding. The implementation of PFT is based on Megablocks' code. We thank Megablock team for their open-source efforts.
+We introduce **PFT (Padding-Free Token) buffers**: instead of fixed [E, C, H] expert buffers and a [S, E, C] dispatch mask, PFT stores only routed tokens (with dropped ones removed) plus a compact set of ERI-arrays—`token_ids`, `expert_ids`, `tokens_per_expert`, and `combine_weights`. The MoE stages (gating → dispatch → expert MLP → combine) are rewritten to run on PFT, with the all-to-alls now uneven and free of zero padding. The implementation of PFT is based on Megablocks' code, with several key enhancements, e.g., we extend it to track additional metadata and achieve fully padding-free execution (with support for token dropping) and replace CUDA kernels with efficient torch/Triton implementations. We thank the Megablocks team for their open-source contributions. 
 
-To make this fast across vendors, we implement **Triton gather/scatter kernels** that coalesce irregular PFT accesses and a sequential-GEMM path that launches one GEMM per local expert on uneven token batches.
+To make this fast across hardware from different vendors, we implement **Triton gather/scatter kernels** that coalesce irregular PFT accesses and a sequential-GEMM path that launches one GEMM per local expert on uneven token batches.
 
 **What this buys us.** Isolating PFT (disabling other tricks) on 256 GPUs:
 
@@ -92,13 +92,13 @@ SSMB lowers peak memory increasingly as TP grows, and—unlike activation checkp
 <sub>^ Left: memory saving; Right: SSMB vs. activation checkpointing</sub>
 
 ### End-to-end results on Frontier
-X-MoE delivers better training efficiency that SOTA frameworks on Frontier: On 256 GPUs, DeepSpeed-MoE/TED/Tutel OOM on 201B-parameter “Large”, while X-MoE trains it; on 55.2B “Medium”, X-MoE is 5.15× faster than DeepSpeed-TED and 1.42× faster than Tutel. 
-<p align="center">
-  <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="70%">
-</p>
+
+After solving all the issues mentioned above, X-MoE delivers better training efficiency than SOTA frameworks on Frontier: On 256 GPUs, DeepSpeed-MoE/TED/Tutel OOM on the 201B-parameter “Large”, while X-MoE successfully trains it; on the 55.2B “Medium”, X-MoE is 5.15× faster than DeepSpeed-TED and 1.42× faster than Tutel.
+
+<p align="center"> <img src="imgs/main-result.jpg" alt="X-MoE Overview" width="70%"> </p>
 
 ## Additional training recipes/observations on ROCm devices
-We also want to share some extra information: the practical lessons and solutions we learned while training on Frontier, which may serve as useful references for scaling model training on ROCm-based devices.
+We also want to share some extra practical lessons and solutions we learned while training on Frontier, which may serve as useful references for scaling model training on ROCm-based or other non-NVIDIA devices.
 
 1. **ROCm GEMM performance.**
 On a single node, the primary bottleneck is the efficiency of GEMM operations in rocBLAS. Compared to CUDA devices, it’s harder to approach the same percentage of peak TFLOPs. For example, while GEMM can theoretically reach >80% of peak TFLOPs on NVIDIA GPUs, we observed only ~60% under the same settings on MI250X. To improve efficiency, it’s often worthwhile to tune the matrix dimensions of the model specifically for ROCm devices.
@@ -112,19 +112,8 @@ At very large scales, the dominant bottleneck becomes all-to-all stragglers. We 
   <img src="imgs/stragglers.jpg" alt="X-MoE Overview" width="45%">
 </p>
 
-## Repro details
+## Experiment environment details
 
 We used PyTorch 2.2.0, ROCm 5.7.1, DeepSpeed 0.15.5, RCCL + AWS-OFI-RCCL (libfabric 1.20.1), and standard env tuning for Frontier. MI250X peak is ~191.5 TFLOPS per GCD (effective GPU). 
 
-## Citation
-```
-@misc{yuan2025xmoeenablingscalabletraining,
-      title={X-MoE: Enabling Scalable Training for Emerging Mixture-of-Experts Architectures on HPC Platforms}, 
-      author={Yueming Yuan and Ahan Gupta and Jianping Li and Sajal Dash and Feiyi Wang and Minjia Zhang},
-      year={2025},
-      eprint={2508.13337},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2508.13337}, 
-}
-```
+

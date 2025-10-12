@@ -908,16 +908,23 @@ class MOELayer(Base):
         elif use_tutel and TUTEL_INSTALLED and gate.k != 1:
             logger.warning("To enable Tutel optimization, use top-1 instead of top-2 gate. "
                            "Proceeding without Tutel.")
+            
+        print (f'[deepspeed/moe/sharded_moe.py] init')
 
     def _set_ep_group(self, ep_group):
         self.ep_group = ep_group
         self.gate._set_ep_group(ep_group)
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
+        import os
+        rank=os.getenv ('RANK')
+        self.wall_clock_breakdown = os.getenv ("WALL_CLOCK_BREAKDOWN")=="true"
+        # print (f'[deepspeed/moe/sharded_moe.py] {rank=}, {self.ep_group=}, {self.ep_group_name=}, {self.wall_clock_breakdown=}')
 
         if self.wall_clock_breakdown:
             torch.cuda.synchronize()
-            torch.distributed.barrier()
+            torch.distributed.barrier()  # Zixian: 09/28/2025: megatron pp2 ep2, rank0,1 stuck here. 
+            # torch.distributed.barrier (group=self.ep_group)
             self.timers(MOE_TIMER).start()
 
         # Implement Algorithm 2 from GShard paper.
@@ -985,7 +992,11 @@ class MOELayer(Base):
             # an allgather to ensure correctness,
             dispatched_input = drop_tokens(dispatched_input, dim=1)
 
+        # print (f'[deepspeed/moe/sharded_moe.py] before _AllToAll {rank=}, {self.ep_group=}, {self.ep_group_name=}')
+
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        
+        # print (f'[deepspeed/moe/sharded_moe.py] after _AllToAll {rank=}, {self.ep_group=}, {self.ep_group_name=}')
 
         if self.wall_clock_breakdown:
             torch.cuda.synchronize()

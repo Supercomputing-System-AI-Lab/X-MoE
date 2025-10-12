@@ -27,6 +27,7 @@ from .sharded_moe import _capacity, _one_hot_to_float, einsum
 from .v2opt.utils import remove_zero_rows, restore_zero_rows, compare_tensors, compare_uneven_and_padded
 
 from .v2opt.rbd import RBDispatcher, RBCombiner
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 if TYPE_CHECKING:
     Base = Module[Tensor]
@@ -207,6 +208,8 @@ class MOEv2Layer(Base):
 
         self.use_pft = use_pft
         self.drop_tokens = drop_tokens
+        
+        # print (f'{dist.get_rank()=}, {self.ep_group=}, {self.ep_size=}, {self.ep_group_name=}, {self.num_local_experts=}, {self.num_shared_experts}, {self.experts=}')
 
     def _set_ep_group(self, ep_group):
         self.ep_group = ep_group
@@ -217,107 +220,121 @@ class MOEv2Layer(Base):
         return dist.get_rank() // bwc_tensor_model_parallel_world_size(groups.mpu) % self.ep_size 
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
+        
+        import os
+        rank = os.getenv ('RANK')
+        self.wall_clock_breakdown = os.getenv ("WALL_CLOCK_BREAKDOWN")=="true"
+        # self.wall_clock_breakdown = False
+        # self.wall_clock_breakdown = True 
+        # print (f'[moe_v2 MOEv2Layer forward]')
 
         if self.wall_clock_breakdown:
             torch.distributed.barrier()
             self.timers(MOE_TIMER).start()
 
-        d_model = input[0].shape[-1]
-        reshaped_input = input[0].reshape(-1, d_model)
+        with record_function("MoE - Gating & Reshaping"):
+            d_model = input[0].shape[-1]
+            reshaped_input = input[0].reshape(-1, d_model)
 
-        tensor_model_world_size = bwc_tensor_model_parallel_world_size(groups.mpu)
+            tensor_model_world_size = bwc_tensor_model_parallel_world_size(groups.mpu)
 
-        # sequence-sharded MoE block: drop tokens at the beginning of the sparse MoE layer.
-        if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
-            orig_shape = reshaped_input.shape
-            reshaped_input = drop_tokens(reshaped_input, dim=0)
-            assert reshaped_input.shape[0] == orig_shape[0] // tensor_model_world_size and reshaped_input.shape[1] == orig_shape[1]
+            # sequence-sharded MoE block: drop tokens at the beginning of the sparse MoE layer.
+            if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
+                orig_shape = reshaped_input.shape
+                reshaped_input = drop_tokens(reshaped_input, dim=0)
+                assert reshaped_input.shape[0] == orig_shape[0] // tensor_model_world_size and reshaped_input.shape[1] == orig_shape[1]
 
-        n_tokens = reshaped_input.shape[0]
+            n_tokens = reshaped_input.shape[0]
+            
+            if self.use_pft:
+                self.l_aux, indices, bin_ids, bins, expert_weights, input_splits_tensor = self.gate(reshaped_input, use_pft=True)
+            
+                if self.wall_clock_breakdown:
+                    torch.distributed.barrier()
+                    self.timers(DISPATCH_TIMER).start()
 
-        if self.use_pft:
-            self.l_aux, indices, bin_ids, bins, expert_weights, input_splits_tensor = self.gate(reshaped_input, use_pft=True)
-           
-            if self.wall_clock_breakdown:
-                torch.distributed.barrier()
-                self.timers(DISPATCH_TIMER).start()
+                if self.drop_tokens:
+                    flattened_input = gather_with_token_drop(reshaped_input, indices, bin_ids, bins, n_tokens, self.k)
+                else:
+                    flattened_input = gather(reshaped_input, indices, bin_ids, bins, self.k)
 
-            if self.drop_tokens:
-                flattened_input = gather_with_token_drop(reshaped_input, indices, bin_ids, bins, n_tokens, self.k)
+                if self.wall_clock_breakdown:
+                    torch.distributed.barrier()
+                    self.timers(DISPATCH_TIMER).stop()
+                    self.time_dispatch = self.timers(DISPATCH_TIMER).elapsed(reset=False)
+
+                self.exp_counts = input_splits_tensor
             else:
-                flattened_input = gather(reshaped_input, indices, bin_ids, bins, self.k)
+                self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+                if self.wall_clock_breakdown:
+                    torch.distributed.barrier()
+                    self.timers(DISPATCH_TIMER).start()
 
-            if self.wall_clock_breakdown:
-                torch.distributed.barrier()
-                self.timers(DISPATCH_TIMER).stop()
-                self.time_dispatch = self.timers(DISPATCH_TIMER).elapsed(reset=False)
+                dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
 
-            self.exp_counts = input_splits_tensor
-        else:
-            self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
-            if self.wall_clock_breakdown:
-                torch.distributed.barrier()
-                self.timers(DISPATCH_TIMER).start()
+                flattened_input, input_splits_tensor, padding_mask = remove_zero_rows(dispatched_input)
 
-            dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
-
-            flattened_input, input_splits_tensor, padding_mask = remove_zero_rows(dispatched_input)
-
-            if self.wall_clock_breakdown:
-                torch.distributed.barrier()
-                self.timers(DISPATCH_TIMER).stop()
-                self.time_dispatch = self.timers(DISPATCH_TIMER).elapsed(reset=False)
+                if self.wall_clock_breakdown:
+                    torch.distributed.barrier()
+                    self.timers(DISPATCH_TIMER).stop()
+                    self.time_dispatch = self.timers(DISPATCH_TIMER).elapsed(reset=False)
         
-        output_splits_tensor = _AllToAll.apply(self.ep_group, input_splits_tensor)
-        input_splits_tensor_ep = input_splits_tensor.view(-1, self.num_local_experts).sum(dim=1)
-        output_splits_tensor_ep = output_splits_tensor.view(-1, self.num_local_experts).sum(dim=1)
+        with record_function("MoE - Dispatch A2A - 1"):
+            output_splits_tensor = _AllToAll.apply(self.ep_group, input_splits_tensor)
+            input_splits_tensor_ep = input_splits_tensor.view(-1, self.num_local_experts).sum(dim=1)
+            output_splits_tensor_ep = output_splits_tensor.view(-1, self.num_local_experts).sum(dim=1)
 
-        input_splits = input_splits_tensor_ep.tolist()
-        output_splits = output_splits_tensor_ep.tolist()
+            input_splits = input_splits_tensor_ep.tolist()
+            output_splits = output_splits_tensor_ep.tolist()
 
         assert sum(input_splits) == flattened_input.shape[0], f"input_split sum {sum(input_splits)} != input shape [0] {flattened_input.shape[0]} on rank {dist.get_rank()}"
 
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(FIRST_ALLTOALL_TIMER).start()
+        with record_function("MoE - Dispatch A2A - 2"):
+            if self.wall_clock_breakdown:
+                torch.distributed.barrier()
+                self.timers(FIRST_ALLTOALL_TIMER).start()
+                
+            # print (f'[moe_v2 MOEv2Layer forward before _AllToAllSingle.apply]')
 
-        # dispatch all-to-all
-        dispatched_output = _AllToAllSingle.apply(self.ep_group, flattened_input, input_splits, output_splits)
+            # dispatch all-to-all    
+            dispatched_output = _AllToAllSingle.apply(self.ep_group, flattened_input, input_splits, output_splits)
 
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(FIRST_ALLTOALL_TIMER).stop()
-            self.time_falltoall = self.timers(FIRST_ALLTOALL_TIMER).elapsed(reset=False)
+            if self.wall_clock_breakdown:
+                torch.distributed.barrier()
+                self.timers(FIRST_ALLTOALL_TIMER).stop()
+                self.time_falltoall = self.timers(FIRST_ALLTOALL_TIMER).elapsed(reset=False)
 
 
         # splits = output_splits_tensor.view(-1, self.num_local_experts).sum(dim=0).tolist() 
         # assert sum(splits) == dispatched_output.shape[0], "sum of local splits != dispatched output shape"
         
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(EXPERTS_TIMER).start()
+        with record_function("MoE - Expert & Regrouping"):
+            if self.wall_clock_breakdown:
+                torch.distributed.barrier()
+                self.timers(EXPERTS_TIMER).start()
 
-        #%%%%%%
-        # expert_output_uneven = self.experts(dispatched_output, splits)
-        #%%%%%%
+            #%%%%%%
+            # expert_output_uneven = self.experts(dispatched_output, splits)
+            #%%%%%%
 
-        ##################
-        expert_output_uneven = self.experts(dispatched_output, output_splits_tensor)
+            ##################
+            expert_output_uneven = self.experts(dispatched_output, output_splits_tensor)
         
-        # recover the expoert ouput uneven
-        M = output_splits_tensor.shape[0]
-        N = self.num_local_experts
-        K = M // N
-        assert M % N == 0
-        output_splits_tensor_interleaved = output_splits_tensor.reshape(K, N, -1).transpose(0, 1).reshape(M)
-        expert_output_uneven_interleaved = torch.split(expert_output_uneven, output_splits_tensor_interleaved.tolist(), dim=0)
-        expert_output_uneven_interleaved = torch.cat([
-            torch.cat(expert_output_uneven_interleaved[idx::K], dim=0)
-            for idx in range(K)
-        ], dim=0)
+            # recover the expoert ouput uneven
+            M = output_splits_tensor.shape[0]
+            N = self.num_local_experts
+            K = M // N
+            assert M % N == 0
+            output_splits_tensor_interleaved = output_splits_tensor.reshape(K, N, -1).transpose(0, 1).reshape(M)
+            expert_output_uneven_interleaved = torch.split(expert_output_uneven, output_splits_tensor_interleaved.tolist(), dim=0)
+            expert_output_uneven_interleaved = torch.cat([
+                torch.cat(expert_output_uneven_interleaved[idx::K], dim=0)
+                for idx in range(K)
+            ], dim=0)
 
         # combine all-to-all
-        expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
+        with record_function ("MoE - Combine A2A"): 
+            expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
         ##################
 
         if self.wall_clock_breakdown:
@@ -330,44 +347,46 @@ class MOEv2Layer(Base):
         #expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven, output_splits, input_splits)
         #%%%%%%
         
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(SECOND_ALLTOALL_TIMER).stop()
-            self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
-        
-        if self.use_pft:
-            expert_output = expert_output_uneven
-        else:
-            expert_output = restore_zero_rows(expert_output_uneven, padding_mask)
-
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(COMBINE_TIMER).start()
-
-        if self.use_pft:
-            if self.drop_tokens:
-                combined_output = scatter_with_token_drop(expert_output, indices, bin_ids, expert_weights, bins, n_tokens, self.k)
+            if self.wall_clock_breakdown:
+                torch.distributed.barrier()
+                self.timers(SECOND_ALLTOALL_TIMER).stop()
+                self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
+                
+        with record_function ("MoE - Regrouping"): 
+            
+            if self.use_pft:
+                expert_output = expert_output_uneven
             else:
-                combined_output = scatter(expert_output, indices, bin_ids, expert_weights, bins, self.k)
-        else:
-            combined_output = einsum("sec,ecm->sm", combine_weights.type_as(input[0]), expert_output)
+                expert_output = restore_zero_rows(expert_output_uneven, padding_mask)
+
+            if self.wall_clock_breakdown:
+                torch.distributed.barrier()
+                self.timers(COMBINE_TIMER).start()
+
+            if self.use_pft:
+                if self.drop_tokens:
+                    combined_output = scatter_with_token_drop(expert_output, indices, bin_ids, expert_weights, bins, n_tokens, self.k)
+                else:
+                    combined_output = scatter(expert_output, indices, bin_ids, expert_weights, bins, self.k)
+            else:
+                combined_output = einsum("sec,ecm->sm", combine_weights.type_as(input[0]), expert_output)
 
 
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(COMBINE_TIMER).stop()
-            self.time_combine = self.timers(COMBINE_TIMER).elapsed(reset=False)
+            if self.wall_clock_breakdown:
+                torch.distributed.barrier()
+                self.timers(COMBINE_TIMER).stop()
+                self.time_combine = self.timers(COMBINE_TIMER).elapsed(reset=False)
 
-        # sequence-sharded MoE block: gather tokens at the end of the sparse MoE layer.
-        if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
-            combined_output = gather_tokens(combined_output, dim=0)
-            assert combined_output.shape == orig_shape
+            # sequence-sharded MoE block: gather tokens at the end of the sparse MoE layer.
+            if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
+                combined_output = gather_tokens(combined_output, dim=0)
+                assert combined_output.shape == orig_shape
 
-        a = combined_output.reshape(input[0].shape)
-        
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(MOE_TIMER).stop()
-            self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
+            a = combined_output.reshape(input[0].shape)
+            
+            if self.wall_clock_breakdown:
+                torch.distributed.barrier()
+                self.timers(MOE_TIMER).stop()
+                self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
 
         return a

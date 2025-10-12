@@ -137,6 +137,8 @@ def _create_expert_and_data_parallel(expert_parallel_size_, use_data_before_expe
     world_size = dist.get_world_size()
     pp_world_size = 1 if mpu is None else bwc_pipeline_parallel_world_size(mpu)
     rank = dist.get_rank()
+    
+    print (f'[deepspeed/utils/group.py] {world_size=} {pp_world_size=} {expert_parallel_size_=}')
 
     pp_stride = world_size // pp_world_size
     _ensure_divisibility(pp_stride, expert_parallel_size_)

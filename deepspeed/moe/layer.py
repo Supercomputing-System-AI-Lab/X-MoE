@@ -16,6 +16,8 @@ from .moe_v2 import MOEv2Layer, TopKGatev2
 from .moe_rbd import TopKGateRBD, MOEv2LayerRBD
 from .v2opt.utils import print_rank
 
+from torch.profiler import record_function
+
 SEE_MEMORY = False
 
 class MoE(nn.Module):
@@ -125,6 +127,7 @@ class MoE(nn.Module):
         }
 
         if use_rbd:
+            print (f'[deepspeed/moe/layer.py] MOEv2LayerRBD')
             self.deepspeed_moe = MOEv2LayerRBD(
                 **moe_layer_params,
                 k=k,
@@ -132,6 +135,7 @@ class MoE(nn.Module):
                 drop_tokens=drop_tokens
             )
         elif use_uneven_all2all:
+            print (f'[deepspeed/moe/layer.py] MOEv2Layer')
             self.deepspeed_moe = MOEv2Layer(
                 **moe_layer_params,
                 k=k,
@@ -139,6 +143,7 @@ class MoE(nn.Module):
                 drop_tokens=drop_tokens
             )
         else:
+            print (f'[deepspeed/moe/layer.py] MOELayer')
             self.deepspeed_moe = MOELayer(
                 **moe_layer_params,
                 use_tutel=use_tutel
@@ -197,6 +202,7 @@ class MoE(nn.Module):
 
             * exp_counts (Tensor): expert count
         """
+        # print (f'[deepspeed/moe/layer.py - MoE - forward] inside moelayer forward')
         
         # torch.cuda.memory._record_memory_history(
         #     max_entries=100000

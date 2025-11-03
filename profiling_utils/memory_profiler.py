@@ -7,6 +7,12 @@ import atexit
 from datetime import datetime
 from pathlib import Path
 
+
+# --- NEW: Add imports needed for final analysis ---
+import pandas as pd
+import glob
+import re
+
 # This is a dummy logger that does nothing if the real logger isn't initialized.
 class _DummyLogger:
     def log(self, *args, **kwargs): pass
@@ -50,7 +56,8 @@ class MemoryLogger:
         
         try:
             self.file_handler = open(self.log_file_path, 'w', newline='')
-            self.writer = csv.writer(self.file_handler)
+            # self.writer = csv.writer(self.file_handler)
+            self.writer = csv.writer(self.file_handler, quoting=csv.QUOTE_ALL)
             self.writer.writerow([
                 "timestamp", "step", "event", "layer",
                 "allocated_gb", "peak_allocated_gb",
@@ -94,10 +101,27 @@ class MemoryLogger:
         torch.cuda.reset_peak_memory_stats()
         self.log(event="start_of_step")
 
+    # def close(self):
+    #     if self.file_handler:
+    #         self.file_handler.close()
+    #         self.file_handler = None
+    
+# --- MODIFIED: The close method now triggers the summary printout ---
     def close(self):
+        """Close the file handle and, on rank 0, print the max memory summary."""
         if self.file_handler:
             self.file_handler.close()
             self.file_handler = None
+
+        # Synchronize all processes to ensure all log files are fully written
+        # before rank 0 starts analyzing them.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # Only Rank 0 should perform the analysis and print the summary.
+        if self.rank == 0:
+            _calculate_and_print_max_memory(log_dir=MemoryLogger.log_dir)
+
 
 
 # --- GLOBAL FUNCTIONS ---
@@ -112,7 +136,6 @@ def init_memory_logger(work_dir=None):
             rank = torch.distributed.get_rank()
             if work_dir is None:
                 work_dir = Path.home()
-            
             MemoryLogger._instance = MemoryLogger(rank, work_dir)
             
             if rank == 0:
@@ -135,3 +158,53 @@ def set_step(step_num):
     logger.step = step_num
     torch.cuda.reset_peak_memory_stats()
     logger.log(event="start_of_step")
+    
+# --- NEW: ANALYSIS FUNCTION CALLED AUTOMATICALLY AT EXIT ---
+
+def _calculate_and_print_max_memory(log_dir):
+    """
+    Analyzes all memory CSVs to find the max 'reserved_gb' and 'allocated_gb'
+    for each rank and prints a summary table.
+    """
+    print("\n" + "="*80)
+    print("--- [Rank 0] Analyzing Peak Memory Usage from Logs ---")
+    print(f"Log Directory: {log_dir}")
+    print("="*80)
+
+    if not log_dir or not os.path.isdir(log_dir):
+        print("Error: Log directory not found. Cannot analyze memory usage.")
+        return
+
+    file_pattern = os.path.join(log_dir, 'memory_rank_*.csv')
+    all_files = sorted(glob.glob(file_pattern), key=lambda p: int(re.search(r'rank_(\d+).csv', p).group(1)))
+
+    if not all_files:
+        print("Error: No memory log files found to analyze.")
+        return
+
+    results = []
+    for file_path in all_files:
+        try:
+            rank_id = int(re.search(r'rank_(\d+).csv', file_path).group(1))
+            df = pd.read_csv(file_path)
+            if not df.empty:
+                max_reserved = df['reserved_gb'].max()
+                max_allocated = df['allocated_gb'].max()
+                results.append({'rank': rank_id, 'max_reserved': max_reserved, 'max_allocated': max_allocated})
+        except Exception as e:
+            print(f"Warning: Could not process file {file_path}. Error: {e}")
+
+    if results:
+        print(f"{'Rank':<6} | {'Max Reserved (GB)':<20} | {'Max Allocated (GB)':<20}")
+        print("-" * 55)
+        for res in results:
+            print(f"{res['rank']:<6} | {res['max_reserved']:<20.4f} | {res['max_allocated']:<20.4f}")
+        
+        overall_max_reserved = max(res['max_reserved'] for res in results)
+        overall_max_allocated = max(res['max_allocated'] for res in results)
+        print("-" * 55)
+        print(f"Overall Peak Reserved:  {overall_max_reserved:.4f} GB")
+        print(f"Overall Peak Allocated: {overall_max_allocated:.4f} GB")
+    else:
+        print("No valid data found in log files.")
+    print("="*80 + "\n")

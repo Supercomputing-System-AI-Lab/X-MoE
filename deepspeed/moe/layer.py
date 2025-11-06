@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepspeed.utils import groups, log_dist
-from .experts import Experts
+from .experts import Experts, FusedExperts
 from .sharded_moe import MOELayer, UnblancedMOELayer, TopKGate, see_memory_usage
 from .moe_v2 import MOEv2Layer, TopKGatev2
 from .moe_rbd import TopKGateRBD, MOEv2LayerRBD
@@ -43,6 +43,7 @@ class MoE(nn.Module):
 
     def __init__(self,
                  hidden_size: int,
+                 config,
                  expert: nn.Module,
                  num_experts: int = 1,
                  num_shared_experts: int = 0,
@@ -62,6 +63,7 @@ class MoE(nn.Module):
                  use_uneven_all2all: bool = False,
                  use_pft: bool = False,
                  use_rbd: bool = False,
+                 use_groupedGEMM: bool = False,
                  rbd_mesh_size: int = 8,
                  ) -> None:
 
@@ -78,6 +80,7 @@ class MoE(nn.Module):
         self.num_shared_experts = num_shared_experts
 
         self.use_rbd = use_rbd
+        self.use_groupedGEMM = use_groupedGEMM
         self.mesh_size = min(self.ep_size, rbd_mesh_size)
         self.rbd_local_group_name = f"local_size_{self.mesh_size}"
 
@@ -95,8 +98,10 @@ class MoE(nn.Module):
         if use_tutel:
             assert not use_uneven_all2all, "Tutel is incompatible with uneven all2all"
 
-        experts = Experts(expert, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
-
+        if self.use_groupedGEMM:
+            experts = FusedExperts(config, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
+        else:
+            experts = Experts(expert, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
         gate_params = {
             "model_dim": hidden_size,
             "num_experts": num_experts,

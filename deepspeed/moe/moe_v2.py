@@ -332,16 +332,18 @@ class MOEv2Layer(Base):
                 for idx in range(K)
             ], dim=0)
 
-        # combine all-to-all
-        with record_function ("MoE - Combine A2A"): 
-            expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
-        ##################
-
+        
         if self.wall_clock_breakdown:
             torch.distributed.barrier()
             self.timers(EXPERTS_TIMER).stop()
             self.time_experts = self.timers(EXPERTS_TIMER).elapsed(reset=False)
             self.timers(SECOND_ALLTOALL_TIMER).start()
+        
+        # combine all-to-all
+        with record_function ("MoE - Combine A2A"): 
+            expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
+        ##################
+
 
         #%%%%%%
         #expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven, output_splits, input_splits)

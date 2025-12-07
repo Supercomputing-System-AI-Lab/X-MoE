@@ -7,6 +7,7 @@ import os
 import glob
 
 import re as regex
+import numpy as np
 
 from functools import partial
 
@@ -181,6 +182,13 @@ class PipelineModule(nn.Module):
         self._grid = PipelineParallelGrid(process_group=self.world_group, topology=self._topo)
 
         self.stage_id = self._topo.get_coord(self.global_rank).pipe
+        
+        
+        self.activation_checkpoint_interval = activation_checkpoint_interval
+        # 11/27/2025: Zixian: added to restore the value back to originally set interval
+        self.original_activation_checkpoint_interval = activation_checkpoint_interval 
+
+        self.activation_checkpoint_func = activation_checkpoint_func
 
         # Initialize partition information
         self._layer_specs = list(layers)
@@ -198,9 +206,6 @@ class PipelineModule(nn.Module):
         #newseed = get_accelerator().initial_seed() + self._grid.get_stage_id()
         #ds_utils.set_random_seed(newseed)
 
-        self.activation_checkpoint_interval = activation_checkpoint_interval
-
-        self.activation_checkpoint_func = activation_checkpoint_func
 
         #storage for precomputed checkpointeble results
         self.is_checkpointable_results = []
@@ -218,14 +223,30 @@ class PipelineModule(nn.Module):
         self.dynamic_shape = dynamic_shape
 
     def _precompute_checkpointable_values(self):
+
         if self.activation_checkpoint_interval > 0 and self.is_checkpointable_results_interval != self.activation_checkpoint_interval:
             num_layers = len(self.forward_funcs)
             self.interval_was_zero = False
             for start_idx in range(0, num_layers, self.activation_checkpoint_interval):
                 end_idx = min(start_idx + self.activation_checkpoint_interval, num_layers)
                 funcs = self.forward_funcs[start_idx:end_idx]
-                self.is_checkpointable_results.append(self._is_checkpointable(funcs))
+                # whether naturally function call is checkpointable 
+                should_checkpoint = self._is_checkpointable(funcs)
+                # Zixian: 11/28/2025: determine whether to uneven pp ckpt 
+                DYNAMIC_CHECKPOINT=os.getenv("DYNAMIC_CHECKPOINT")
+                print (f'{DYNAMIC_CHECKPOINT=}')
+                if DYNAMIC_CHECKPOINT == 'True': 
+                    assert self.activation_checkpoint_interval > 0, "[pipe/module.py] Enabling uneven_pp_partitioning + ckpting, but without passing checkpointing arg"
+                    # if self.stage_id >= int(self.num_stages * 2 / 4):
+                    if self.stage_id >= 1 or start_idx != 2:
+                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Disabling checkpointing for layers {start_idx}')
+                        should_checkpoint = False
+                    else:
+                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Enabling checkpointing for layers {start_idx}')
+                        
+                self.is_checkpointable_results.append(should_checkpoint)
             self.is_checkpointable_results_interval = self.activation_checkpoint_interval
+        print (f'[pipe/module.py] AFTER calling _precompute_checkpointable_values {self.stage_id=} {self.is_checkpointable_results=} {self.is_checkpointable_results_interval=}')
 
     def _build(self):
         specs = self._layer_specs
@@ -351,6 +372,7 @@ class PipelineModule(nn.Module):
                 # Single tensor inputs need to be unwrapped
                 if len(inputs) == 1:
                     inputs = inputs[0]
+                # print (f'[pipe.module.py]: {self.local_rank=} uneven-pp exec_func() {start=}, {end=}')
                 for idx, layer in enumerate(self.forward_funcs[start:end]):
                     self.curr_layer = idx + self._local_start
                     if self.seed_layers:
@@ -365,6 +387,8 @@ class PipelineModule(nn.Module):
 
             return exec_func
 
+        # print (f'[pipe.module.py]: {self.local_rank=} uneven-pp {self.forward_funcs=}')
+        # print (f'[pipe/module.py] forward {self.local_rank=} {self.activation_checkpoint_interval=}')
         if self.activation_checkpoint_interval == 0:
             func = exec_range_func(0, len(self.forward_funcs))
             x = func(forward_input)
@@ -381,11 +405,14 @@ class PipelineModule(nn.Module):
                 # need to be careful not to double-wrap tensors with tuple.
                 if not isinstance(x, tuple):
                     x = (x, )
-
+                    
+                # print (f'[pipe/module.py] WHETHER TO CKPT {self.local_rank=} {start_idx=} {end_idx=} {is_checkpointable_result=}')
                 if is_checkpointable_result:
                     x = self.activation_checkpoint_func(exec_range_func(start_idx, end_idx), *x)
                 else:
                     x = exec_range_func(start_idx, end_idx)(*x)
+                    
+        # print (f'[pipe.module.py]: {self.local_rank=} done executing its stages')
         return x
 
     def _partition_layers(self, method='uniform'):
@@ -416,6 +443,20 @@ class PipelineModule(nn.Module):
             raise NotImplementedError(f'Partitioning method {method} not implemented.')
 
         # Print some information on the partitioning.
+        
+        # self.parts = [np.int64(0), np.int64(12), np.int64(23), np.int64(28), 33]
+        # self.parts = [np.int64(0), np.int64(5), np.int64(12), np.int64(20), 33]
+        if os.getenv("UNEVEN_PP_PARTITION") == "True": 
+            print (f'{os.getenv("UNEVEN_PP_PARTITION")=}')
+            # 11/27/2025: Zixian: 50B pp4 test: stage0&1 has 5 layers, stage 2&3 has 7 layers
+            #                     5*(4T_g) = 20T_g -- ckpt early layer
+            #                     7*(3T_g) = 21T_g -- no-ckpt on later layer
+            #                     6*(4T_g) = 24T_g -- ckpt every layer
+            # first stage has 2 more other layers, last stage has 4 more other layers
+            self.parts = [np.int64(0), np.int64(9), np.int64(17), np.int64(25), 37]
+            # print (f'{os.getenv("EVEN_PP_PARTITION")=}')
+            
+        print (f'[pipe/module.py] {self.global_rank=} pp-uneven\n {self.parts=}')
         if self.global_rank == 0:
             for stage in range(num_stages):
                 start = self.parts[stage]
@@ -517,9 +558,11 @@ class PipelineModule(nn.Module):
         return tied_comms
 
     def partitions(self):
+        print (f'[pipe/module.py] running self.partitions()')
         return self.parts
 
     def stage_owner(self, layer_idx):
+        print (f'[pipe/module.py] running self.stage_owner(layer_idx)')
         assert 0 <= layer_idx < self._num_layers
         for stage in range(self._topo.get_dim('pipe')):
             if self.parts[stage] <= layer_idx < self.parts[stage + 1]:

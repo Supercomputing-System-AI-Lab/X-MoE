@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
+import os 
 from deepspeed import comm as dist
 
 from collections import namedtuple
@@ -434,13 +434,38 @@ class PipelineParallelGrid:
     # These are model parallel groups across all types of model parallelism.
     # Deepspeed uses them to detect overflow, etc.
     def get_model_parallel_rank(self):
-        return self.ds_model_rank
+        if os.getenv ("UNEVEN_PP_PARTITION") == "True": 
+            # NEW: Use slice (tensor) rank. 
+            # If get_slice_parallel_rank() is missing, use logic below:
+            if 'model' in self._topo.get_axis_names():
+                return self._topo.get_coord(rank=self.global_rank).model
+            else:
+                return 0
+        else: 
+            # OLD: return self.ds_model_rank
+            return self.ds_model_rank
+        
+        
 
     def get_model_parallel_world_size(self):
-        return self.ds_model_world_size
+        if os.getenv ("UNEVEN_PP_PARTITION") == "True": 
+            # NEW: Use slice (tensor) size (which is 1 in your setup)
+            return self.slice_parallel_size
+        else: 
+            # OLD: return self.ds_model_world_size
+            return self.ds_model_world_size
+            
+        
 
     def get_model_parallel_group(self):
-        return self.ds_model_proc_group
+        if os.getenv ("UNEVEN_PP_PARTITION") == "True": 
+            # NEW: Return the slice process group directly
+            return self.slice_proc_group
+        else: 
+            # OLD: return self.ds_model_proc_group
+            return self.ds_model_proc_group
+            
+        
 
     # For Megatron-style tensor slicing
     def get_slice_parallel_rank(self):

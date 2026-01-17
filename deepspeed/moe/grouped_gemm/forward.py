@@ -101,6 +101,103 @@ def _grouped_gemm_forward_kernel(
 
             # Update the total tiles count for the next expert group
             processed_tiles += num_tiles_per_expert
+# @triton.jit
+# def _grouped_gemm_forward_kernel(
+#     # Pointers
+#     x_ptr,
+#     w_ptr,
+#     m_sizes_ptr,
+#     y_ptr,
+#     # Dimensions
+#     M: int,
+#     N: tl.constexpr,
+#     K: tl.constexpr,
+#     NUM_EXPERTS: tl.constexpr,
+#     NUM_SMS: tl.constexpr,
+#     # Strides
+#     stride_xm: tl.constexpr,
+#     stride_xk: tl.constexpr,
+#     stride_we: tl.constexpr,
+#     stride_wn: tl.constexpr,
+#     stride_wk: tl.constexpr,
+#     stride_ym: tl.constexpr,
+#     stride_yn: tl.constexpr,
+#     # Metadata
+#     BLOCK_SIZE_M: tl.constexpr = 64,
+#     BLOCK_SIZE_N: tl.constexpr = 64,
+#     BLOCK_SIZE_K: tl.constexpr = 64,
+# ) -> None: 
+#     tidx = tl.program_id(0)
+#     m_end = 0
+#     processed_tiles = 0
+#     GROUP_SIZE_M: tl.constexpr = 8  # Triton 默认的 Swizzling 参数
+#     for expert_idx in range(NUM_EXPERTS):
+#         m_start = m_end
+#         m_size = tl.load(m_sizes_ptr + expert_idx).to(tl.int32)
+#         m_end = m_start + m_size
+#         if m_size > 0:
+#             # tiles for this group's GEMM
+#             num_m_tiles = tl.cdiv(m_size, BLOCK_SIZE_M)
+#             num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+#             num_tiles_per_expert = num_m_tiles * num_n_tiles
+
+#             # Lower bound and upper bound are defined relative to the total tiles processed so far
+#             # This ensures that we are only processing tiles for the current expert group AND
+#             # we never exceed the total number of tiles for all expert groups
+#             while tidx >= processed_tiles and tidx < processed_tiles + num_tiles_per_expert:
+#                 tile_idx = tidx - processed_tiles
+
+#                 # Output tile for this thread block for this expert group
+#                 # TODO: Check if L2 cache re-use for this order is optimal
+#                 # tile_m_idx = tile_idx // num_n_tiles
+#                 # tile_n_idx = tile_idx % num_n_tiles
+
+#                 num_pid_m = num_m_tiles
+#                 num_pid_n = num_n_tiles
+                
+#                 # 下面将线性 ID 映射为 Swizzled 2D ID
+#                 num_pid_in_group = GROUP_SIZE_M * num_pid_n
+#                 group_id = tile_idx // num_pid_in_group
+#                 first_pid_m = group_id * GROUP_SIZE_M
+#                 group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                
+#                 # 重新计算 tile_m_idx 和 tile_n_idx
+#                 tile_m_idx = first_pid_m + (tile_idx % group_size_m)
+#                 tile_n_idx = (tile_idx % num_pid_in_group) // group_size_m
+
+#                 offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+#                 offs_m = m_start + tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+#                 x_ptrs = x_ptr + stride_xm * offs_m[:, None] + stride_xk * offs_k[None, :]
+#                 mask_m = offs_m < m_end
+
+#                 offs_n = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+#                 w_ptrs = w_ptr + stride_we * expert_idx + stride_wn * offs_n[:, None] + stride_wk * offs_k[None, :]
+
+#                 accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+#                 # GEMM main loop
+#                 for _ in range(tl.cdiv(K, BLOCK_SIZE_K)):
+#                     tl.multiple_of(x_ptrs, [16, 16])
+#                     tl.multiple_of(w_ptrs, [16, 16])
+                    
+#                     x = tl.load(x_ptrs, mask=mask_m[:, None])
+#                     w = tl.load(w_ptrs)
+
+#                     accumulator += tl.dot(x, w.T)
+
+#                     x_ptrs += stride_xk * BLOCK_SIZE_K
+#                     w_ptrs += stride_wk * BLOCK_SIZE_K
+            
+#                 y = accumulator.to(y_ptr.dtype.element_ty)
+
+#                 y_ptrs = y_ptr + stride_ym * offs_m[:, None] + stride_yn * offs_n[None, :]
+#                 tl.store(y_ptrs, y, mask=mask_m[:, None])
+
+#                 # Move to the next tile within this expert group
+#                 tidx += NUM_SMS
+
+#             # Update the total tiles count for the next expert group
+#             processed_tiles += num_tiles_per_expert
 
 
 def is_int_tensor(x: torch.Tensor) -> bool:

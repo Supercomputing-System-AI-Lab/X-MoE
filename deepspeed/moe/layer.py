@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepspeed.utils import groups, log_dist
-from .experts import Experts, FusedExperts
+from .experts import Experts, FusedExperts_Primus, FusedExperts_Triton
 from .sharded_moe import MOELayer, UnblancedMOELayer, TopKGate, see_memory_usage
 from .moe_v2 import MOEv2Layer, TopKGatev2
 from .moe_rbd import TopKGateRBD, MOEv2LayerRBD
@@ -19,6 +19,18 @@ from .v2opt.utils import print_rank
 from torch.profiler import record_function
 
 SEE_MEMORY = False
+
+def get_hardware_backend():
+    if torch.version.hip is not None:
+        return "amd"
+
+    if torch.version.cuda is not None:
+        return "nvidia"
+    
+    return "cpu"
+BACKEND = get_hardware_backend()
+IS_ROCM = (BACKEND == "amd")
+IS_CUDA = (BACKEND == "nvidia")
 
 class MoE(nn.Module):
     """Initialize an MoE layer.
@@ -64,6 +76,7 @@ class MoE(nn.Module):
                  use_pft: bool = False,
                  use_rbd: bool = False,
                  use_groupedGEMM: bool = False,
+                 use_triton: bool = False,
                  rbd_mesh_size: int = 8,
                  ) -> None:
 
@@ -81,6 +94,7 @@ class MoE(nn.Module):
 
         self.use_rbd = use_rbd
         self.use_groupedGEMM = use_groupedGEMM
+        self.use_triton = use_triton
         self.mesh_size = min(self.ep_size, rbd_mesh_size)
         self.rbd_local_group_name = f"local_size_{self.mesh_size}"
 
@@ -99,7 +113,16 @@ class MoE(nn.Module):
             assert not use_uneven_all2all, "Tutel is incompatible with uneven all2all"
 
         if self.use_groupedGEMM:
-            experts = FusedExperts(config, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
+            if self.use_triton:
+                print("use triton fused experts")
+                experts = FusedExperts_Triton(expert, config, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
+            else:
+                print("use primus fused experts")
+                experts = FusedExperts_Primus(expert, config, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
+            # if IS_ROCM:
+            #     experts = FusedExperts_Primus(expert, config, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
+            # elif IS_CUDA:
+            #     experts = FusedExperts_Triton(expert, config, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
         else:
             experts = Experts(expert, self.num_local_experts, self.expert_group_name, is_uneven_tokens=use_uneven_all2all)
         gate_params = {

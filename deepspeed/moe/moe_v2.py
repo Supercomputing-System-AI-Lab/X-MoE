@@ -224,7 +224,6 @@ class MOEv2Layer(Base):
         import os
         rank = os.getenv ('RANK')
         self.wall_clock_breakdown = os.getenv ("WALL_CLOCK_BREAKDOWN")=="true"
-        # self.wall_clock_breakdown = False
         # self.wall_clock_breakdown = True 
         # print (f'[moe_v2 MOEv2Layer forward]')
 
@@ -308,14 +307,12 @@ class MOEv2Layer(Base):
                 torch.distributed.barrier()
                 self.timers(EXPERTS_TIMER).start()
 
-            #%%%%%%
             # expert_output_uneven = self.experts(dispatched_output, splits)
-            #%%%%%%
 
             ##################
             expert_output_uneven = self.experts(dispatched_output, output_splits_tensor)
         
-            # recover the expoert ouput uneven
+            # recover the expert output uneven
             M = output_splits_tensor.shape[0]
             N = self.num_local_experts
             K = M // N
@@ -338,9 +335,7 @@ class MOEv2Layer(Base):
             self.time_experts = self.timers(EXPERTS_TIMER).elapsed(reset=False)
             self.timers(SECOND_ALLTOALL_TIMER).start()
 
-        #%%%%%%
         #expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven, output_splits, input_splits)
-        #%%%%%%
         
             if self.wall_clock_breakdown:
                 torch.distributed.barrier()

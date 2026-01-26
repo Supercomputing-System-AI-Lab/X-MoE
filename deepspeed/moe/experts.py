@@ -76,7 +76,9 @@ class FusedExperts_Primus(nn.Module):
         
         stacked_up_proj_weights = torch.stack(up_proj_weights, dim=0).transpose(1, 2).contiguous()
         stacked_down_proj_weights = torch.stack(down_proj_weights, dim=0).transpose(1, 2).contiguous()
-
+        del up_proj_weights
+        del down_proj_weights
+        del temp_expert_list
         self.up_proj_weight = nn.Parameter(stacked_up_proj_weights)
         self.down_proj_weight = nn.Parameter(stacked_down_proj_weights)
 

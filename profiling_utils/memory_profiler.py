@@ -198,7 +198,7 @@ def _calculate_and_print_max_memory(log_dir):
         print(f"{'Rank':<6} | {'Max Reserved (GB)':<20} | {'Max Allocated (GB)':<20}")
         print("-" * 55)
         for res in results:
-            print(f"{res['rank']:<6} | {res['max_reserved']:<20.4f} | {res['max_allocated']:<20.4f}")
+            print(f"{res['rank']:<6} | {float(res['max_reserved']):<20.4f} | {float(res['max_allocated']):<20.4f}")
         
         overall_max_reserved = max(res['max_reserved'] for res in results)
         overall_max_allocated = max(res['max_allocated'] for res in results)

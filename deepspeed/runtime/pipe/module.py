@@ -8,6 +8,7 @@ import glob
 
 import re as regex
 import numpy as np
+from typing import List
 
 from functools import partial
 
@@ -237,16 +238,62 @@ class PipelineModule(nn.Module):
                 print (f'{DYNAMIC_CHECKPOINT=}')
                 if DYNAMIC_CHECKPOINT == 'True': 
                     assert self.activation_checkpoint_interval > 0, "[pipe/module.py] Enabling uneven_pp_partitioning + ckpting, but without passing checkpointing arg"
-                    # if self.stage_id >= int(self.num_stages * 2 / 4):
-                    if self.stage_id >= 1 or start_idx != 2:
-                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Disabling checkpointing for layers {start_idx}')
-                        should_checkpoint = False
-                    else:
-                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Enabling checkpointing for layers {start_idx}')
+                    
+                    # Retrieve partitioning 
+                    self.dynamic_checkpointing_partitions=self._str_to_list (os.getenv ("DYNAMIC_CHECKPOINT_PARTITION"))
+                    assert self.dynamic_checkpointing_partitions != [], f"{self.dynamic_checkpointing_partitions=}, check if your launch script enabled exporting DYNAMIC_CHECKPOINT_PARTITION"
+                    
+                    # Assign ckpt partition 
+                    num_ckpt_layers_for_this_stage = self.dynamic_checkpointing_partitions [self.stage_id]
+                    
+                    # first stage has 2 more other layers than transformer, last stage has 3 more other layers at the end
+                    if self.stage_id == 0: 
+                        if (start_idx - 2 >= 0) & (start_idx - 2 < num_ckpt_layers_for_this_stage): 
+                            should_checkpoint = True 
+                        else: 
+                            should_checkpoint = False 
+                    else: 
+                        if start_idx < num_ckpt_layers_for_this_stage: 
+                            should_checkpoint = True 
+                        else: 
+                            should_checkpoint = False  
+                    
+                    # Log and verify 
+                    if should_checkpoint:
+                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Enabling checkpointing for layers {start_idx} given {self.dynamic_checkpointing_partitions=}')
+                    else: 
+                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Disabling checkpointing for layers {start_idx} given {self.dynamic_checkpointing_partitions=}')
                         
                 self.is_checkpointable_results.append(should_checkpoint)
             self.is_checkpointable_results_interval = self.activation_checkpoint_interval
         print (f'[pipe/module.py] AFTER calling _precompute_checkpointable_values {self.stage_id=} {self.is_checkpointable_results=} {self.is_checkpointable_results_interval=}')
+        
+    def _str_to_list(self, input_val) -> List[int]:
+        """
+        Decodes a string (or list of strings) into a list of integers.
+        
+        Handles inputs like:
+        - "8 8 8 8"          (Environment variable string)
+        - ["8", "8", "8"]    (Argparse nargs='+' list)
+        - ["8 8 8 8"]        (Argparse if quoted argument)
+        """
+        if input_val is None:
+            return []
+        
+        # 1. If it comes in as a single string (e.g. from os.getenv)
+        if isinstance(input_val, str):
+            # "8 8 8 8" -> [8, 8, 8, 8]
+            return [int(x) for x in input_val.strip().split()]
+
+        # 2. If it comes in as a list (e.g. from argparse nargs='+')
+        if isinstance(input_val, list):
+            final_list = []
+            for item in input_val:
+                # We split again just in case the user passed quoted strings: --partition "8 8" "8 8"
+                final_list.extend([int(x) for x in item.strip().split()])
+            return final_list
+
+        return []
 
     def _build(self):
         specs = self._layer_specs
@@ -446,15 +493,37 @@ class PipelineModule(nn.Module):
         
         # self.parts = [np.int64(0), np.int64(12), np.int64(23), np.int64(28), 33]
         # self.parts = [np.int64(0), np.int64(5), np.int64(12), np.int64(20), 33]
-        if os.getenv("UNEVEN_PP_PARTITION") == "True": 
-            print (f'{os.getenv("UNEVEN_PP_PARTITION")=}')
+        if os.getenv("UNEVEN_PP") == "True": 
+            print (f'{os.getenv("UNEVEN_PP")=}')
             # 11/27/2025: Zixian: 50B pp4 test: stage0&1 has 5 layers, stage 2&3 has 7 layers
             #                     5*(4T_g) = 20T_g -- ckpt early layer
             #                     7*(3T_g) = 21T_g -- no-ckpt on later layer
             #                     6*(4T_g) = 24T_g -- ckpt every layer
-            # first stage has 2 more other layers, last stage has 4 more other layers
-            self.parts = [np.int64(0), np.int64(9), np.int64(17), np.int64(25), 37]
-            # print (f'{os.getenv("EVEN_PP_PARTITION")=}')
+            # self.parts = [np.int64(0), np.int64(9), np.int64(17), np.int64(25), 37]
+            
+            # first stage has 2 more other layers, last stage has 3 more other layers
+            # stage 0: _to_float16, EmbeddingPipe
+            # stage last: MixedFusedLayerNorm, EmbeddingPipe, float16_to_fp32
+            
+            # Read user assigned partitioning
+            self.uneven_pp_partition = self._str_to_list (os.getenv ("UNEVEN_PP_PARTITION"))
+            assert self.uneven_pp_partition != [], f"{self.uneven_pp_partition=}, check if your launch script enabled exporting UNEVEN_PP_PARTITION"
+            print (f'{self.uneven_pp_partition=}')
+            
+            self.parts = []
+            for idx in range (len (self.uneven_pp_partition) + 1): 
+                if idx == 0: 
+                    self.parts.append (0)
+                elif idx == 1: 
+                    self.parts.append (2 + self.uneven_pp_partition[idx-1] + self.parts[idx-1])
+                elif idx == len (self.uneven_pp_partition):
+                    self.parts.append (3 + self.uneven_pp_partition[idx-1] + self.parts[idx-1])
+                else: 
+                    self.parts.append (self.uneven_pp_partition[idx-1] + self.parts[idx-1])
+            
+            print (f'{self.parts=}')
+        else:
+            print (f'{os.getenv("EVEN_PP_PARTITION")=}')
             
         print (f'[pipe/module.py] {self.global_rank=} pp-uneven\n {self.parts=}')
         if self.global_rank == 0:

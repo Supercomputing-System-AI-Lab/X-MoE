@@ -434,7 +434,7 @@ class PipelineParallelGrid:
     # These are model parallel groups across all types of model parallelism.
     # Deepspeed uses them to detect overflow, etc.
     def get_model_parallel_rank(self):
-        if os.getenv ("UNEVEN_PP_PARTITION") == "True": 
+        if os.getenv ("UNEVEN_PP") == "True": 
             # NEW: Use slice (tensor) rank. 
             # If get_slice_parallel_rank() is missing, use logic below:
             if 'model' in self._topo.get_axis_names():
@@ -448,7 +448,7 @@ class PipelineParallelGrid:
         
 
     def get_model_parallel_world_size(self):
-        if os.getenv ("UNEVEN_PP_PARTITION") == "True": 
+        if os.getenv ("UNEVEN_PP") == "True": 
             # NEW: Use slice (tensor) size (which is 1 in your setup)
             return self.slice_parallel_size
         else: 
@@ -458,7 +458,7 @@ class PipelineParallelGrid:
         
 
     def get_model_parallel_group(self):
-        if os.getenv ("UNEVEN_PP_PARTITION") == "True": 
+        if os.getenv ("UNEVEN_PP") == "True": 
             # NEW: Return the slice process group directly
             return self.slice_proc_group
         else: 

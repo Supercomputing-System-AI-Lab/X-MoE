@@ -60,3 +60,4 @@ tests/unit/saved_checkpoint/
 *.hip
 *.cuh
 *hip_layers.h
+deepspeed/inference/v2/kernels/core_ops/

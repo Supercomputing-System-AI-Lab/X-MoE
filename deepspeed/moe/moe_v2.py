@@ -235,7 +235,6 @@ class MOEv2Layer(Base):
         with record_function("MoE - Gating & Reshaping"):
             d_model = input[0].shape[-1]
             reshaped_input = input[0].reshape(-1, d_model)
-
             tensor_model_world_size = bwc_tensor_model_parallel_world_size(groups.mpu)
 
             # sequence-sharded MoE block: drop tokens at the beginning of the sparse MoE layer.
@@ -248,7 +247,6 @@ class MOEv2Layer(Base):
             
             if self.use_pft:
                 self.l_aux, indices, bin_ids, bins, expert_weights, input_splits_tensor = self.gate(reshaped_input, use_pft=True)
-            
                 if self.wall_clock_breakdown:
                     torch.distributed.barrier()
                     self.timers(DISPATCH_TIMER).start()
@@ -269,11 +267,8 @@ class MOEv2Layer(Base):
                 if self.wall_clock_breakdown:
                     torch.distributed.barrier()
                     self.timers(DISPATCH_TIMER).start()
-
                 dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
-
                 flattened_input, input_splits_tensor, padding_mask = remove_zero_rows(dispatched_input)
-
                 if self.wall_clock_breakdown:
                     torch.distributed.barrier()
                     self.timers(DISPATCH_TIMER).stop()
@@ -313,14 +308,12 @@ class MOEv2Layer(Base):
                 torch.distributed.barrier()
                 self.timers(EXPERTS_TIMER).start()
 
-            #%%%%%%
             # expert_output_uneven = self.experts(dispatched_output, splits)
-            #%%%%%%
 
             ##################
             expert_output_uneven = self.experts(dispatched_output, output_splits_tensor)
         
-            # recover the expoert ouput uneven
+            # recover the expert output uneven
             M = output_splits_tensor.shape[0]
             N = self.num_local_experts
             K = M // N

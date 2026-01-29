@@ -130,6 +130,36 @@ def timed_op(func):
                     # need temp var since 'elapsed' resets events
                     time_elapsed = timers(log_name).elapsed(reset=False)
                     comms_logger.append(raw_name, log_name, time_elapsed, msg_size)
+#        return func(*args, **kwargs)
+        # # Add enabled flag so that overhead to each comm op is two if conditions at most
+        # if comms_logger.enabled:
+        #     if ('prof' in kwargs
+        #             and kwargs['prof']) or comms_logger.prof_all or ('log_name' in kwargs
+        #                                                              and kwargs['log_name'] in comms_logger.prof_ops):
+        #         # Need func args for their defaults
+        #         func_args = get_default_args(func)
+        #         func_args.update(kwargs)
+        #         msg_size = get_msg_size_from_args(func, *args, **kwargs)
+        #         log_name = get_debug_log_name(func_args, comms_logger.debug)
+        #         timers(log_name).start()
+        # # Return the op, then stop the op's timer
+        # try:
+        #     return func(*args, **kwargs)
+        # finally:
+        #     if comms_logger.enabled:
+        #         # Need to make op blocking for accurate logging
+        #         get_accelerator().synchronize()
+        #         # If we're using MPI, we can't simply sync the stream
+        #         if cdb.using_mpi:
+        #             cdb.barrier()
+        #         if ('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all or (
+        #                 'log_name' in kwargs and kwargs['log_name'] in comms_logger.prof_ops):
+        #             log_name = get_debug_log_name(func_args, comms_logger.debug)
+        #             raw_name = func.__name__
+        #             timers(log_name).stop()
+        #             # need temp var since 'elapsed' resets events
+        #             time_elapsed = timers(log_name).elapsed(reset=False)
+        #             comms_logger.append(raw_name, log_name, time_elapsed, msg_size)
 
     return log_wrapper
 

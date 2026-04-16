@@ -221,6 +221,7 @@ class MOEv2Layer(Base):
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
         
+        print (f'inside moe forward')
         import os
         rank = os.getenv ('RANK')
         self.wall_clock_breakdown = os.getenv ("WALL_CLOCK_BREAKDOWN")=="true"
@@ -305,36 +306,63 @@ class MOEv2Layer(Base):
         
         with record_function("MoE - Expert & Regrouping"):
             if self.wall_clock_breakdown:
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
+                torch.cuda.synchronize()
                 self.timers(EXPERTS_TIMER).start()
 
             # expert_output_uneven = self.experts(dispatched_output, splits)
 
             ##################
+            # print (f'[moe_v2.py] BEFORE EXPERT {dispatched_output.shape=}')
             expert_output_uneven = self.experts(dispatched_output, output_splits_tensor)
+            # print (f'[moe_v2.py] AFTER EXPERT {expert_output_uneven.shape=}')
         
-            # recover the expert output uneven
-            M = output_splits_tensor.shape[0]
-            N = self.num_local_experts
-            K = M // N
-            assert M % N == 0
-            output_splits_tensor_interleaved = output_splits_tensor.reshape(K, N, -1).transpose(0, 1).reshape(M)
-            expert_output_uneven_interleaved = torch.split(expert_output_uneven, output_splits_tensor_interleaved.tolist(), dim=0)
-            expert_output_uneven_interleaved = torch.cat([
-                torch.cat(expert_output_uneven_interleaved[idx::K], dim=0)
-                for idx in range(K)
-            ], dim=0)
+            if os.getenv ("USE_TRITON_GROUPGEMM") != 'True': 
+                # print ("WITHOUT USING TRITON GROUPGEMM")
+                # recover the expert output uneven
+                M = output_splits_tensor.shape[0]
+                N = self.num_local_experts
+                K = M // N
+                assert M % N == 0
+                output_splits_tensor_interleaved = output_splits_tensor.reshape(K, N, -1).transpose(0, 1).reshape(M)
+                expert_output_uneven_interleaved = torch.split(expert_output_uneven, output_splits_tensor_interleaved.tolist(), dim=0)
+                expert_output_uneven_interleaved = torch.cat([
+                    torch.cat(expert_output_uneven_interleaved[idx::K], dim=0)
+                    for idx in range(K)
+                ], dim=0)
 
+        # print (f'{os.getenv ("USE_TRITON_GROUPGEMM")=}')
         
-        if self.wall_clock_breakdown:
-            torch.distributed.barrier()
-            self.timers(EXPERTS_TIMER).stop()
-            self.time_experts = self.timers(EXPERTS_TIMER).elapsed(reset=False)
-            self.timers(SECOND_ALLTOALL_TIMER).start()
+                if self.wall_clock_breakdown:
+                    # torch.distributed.barrier()
+                    torch.cuda.synchronize()
+                    self.timers(EXPERTS_TIMER).stop()
+                    torch.distributed.barrier()
+                    self.time_experts = self.timers(EXPERTS_TIMER).elapsed(reset=False)
+                    self.timers(SECOND_ALLTOALL_TIMER).start()
+                
+                # print (f'[moe_v2.py] {expert_output_uneven_interleaved.shape=}')
+                
+                # combine all-to-all
+                with record_function ("MoE - Combine A2A"): 
+                    expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
         
-        # combine all-to-all
-        with record_function ("MoE - Combine A2A"): 
-            expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
+            # If using triton groupgemm 
+            if os.getenv ("USE_TRITON_GROUPGEMM") == 'True': 
+                # print ("USING TRITON GROUPGEMM")
+                if self.wall_clock_breakdown:
+                    # torch.distributed.barrier()
+                    torch.cuda.synchronize()
+                    self.timers(EXPERTS_TIMER).stop()
+                    torch.distributed.barrier()
+                    self.time_experts = self.timers(EXPERTS_TIMER).elapsed(reset=False)
+                    self.timers(SECOND_ALLTOALL_TIMER).start()
+                    
+                # print (f'[moe_v2.py] {expert_output_uneven.shape=}')
+                # combine all-to-all
+                with record_function ("MoE - Combine A2A"): 
+                    # Feed `expert_output_uneven` directly back into the network!
+                    expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven, output_splits, input_splits)
         ##################
 
 
@@ -342,10 +370,10 @@ class MOEv2Layer(Base):
         #expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven, output_splits, input_splits)
         #%%%%%%
         
-            if self.wall_clock_breakdown:
-                torch.distributed.barrier()
-                self.timers(SECOND_ALLTOALL_TIMER).stop()
-                self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
+        if self.wall_clock_breakdown:
+            torch.distributed.barrier()
+            self.timers(SECOND_ALLTOALL_TIMER).stop()
+            self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
                 
         with record_function ("MoE - Regrouping"): 
             

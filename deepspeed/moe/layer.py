@@ -153,9 +153,13 @@ class MoE(nn.Module):
             "ep_size": self.ep_size,
             "num_local_experts": self.num_local_experts
         }
+        
+        import os
+        rank = int (os.getenv ("RANK"))
 
         if use_rbd:
-            print (f'[deepspeed/moe/layer.py] MOEv2LayerRBD')
+            if rank < 4: 
+                print (f'[deepspeed/moe/layer.py] MOEv2LayerRBD')
             self.deepspeed_moe = MOEv2LayerRBD(
                 **moe_layer_params,
                 k=k,
@@ -163,7 +167,8 @@ class MoE(nn.Module):
                 drop_tokens=drop_tokens
             )
         elif use_uneven_all2all:
-            print (f'[deepspeed/moe/layer.py] MOEv2Layer')
+            if rank < 4: 
+                print (f'[deepspeed/moe/layer.py] MOEv2Layer')
             self.deepspeed_moe = MOEv2Layer(
                 **moe_layer_params,
                 k=k,
@@ -171,7 +176,8 @@ class MoE(nn.Module):
                 drop_tokens=drop_tokens
             )
         else:
-            print (f'[deepspeed/moe/layer.py] MOELayer')
+            if rank < 4: 
+                print (f'[deepspeed/moe/layer.py] MOELayer')
             self.deepspeed_moe = MOELayer(
                 **moe_layer_params,
                 use_tutel=use_tutel

@@ -134,9 +134,20 @@ class PipelineModule(nn.Module):
                  activation_checkpoint_interval=0,
                  activation_checkpoint_func=checkpointing.checkpoint,
                  checkpointable_layers=None,
-                 dynamic_shape=False):
+                 dynamic_shape=False,
+                 # ELMoE: explicit partition control
+                 custom_pipeline_partition=None,           # list[int] e.g. [6, 8, 8, 10]
+                 custom_checkpoint_partition=None,       # list[int] e.g. [6, 0, 0, 0]
+                 ):
 
         super().__init__()
+        
+        # Init ELMoE PP ckpt partitions 
+        self.custom_pipeline_partition = custom_pipeline_partition
+        self.custom_checkpoint_partition = custom_checkpoint_partition 
+        
+        print (f'[deepspeed/runtime/pipe/module.py] {self.custom_pipeline_partition=}')
+        print (f'[deepspeed/runtime/pipe/module.py] {self.custom_checkpoint_partition=}')
 
         if num_stages is None and topology is None:
             raise RuntimeError('must provide num_stages or topology')
@@ -180,7 +191,7 @@ class PipelineModule(nn.Module):
                 self._topo = topology
 
         # Construct communicators for pipeline topology
-        self._grid = PipelineParallelGrid(process_group=self.world_group, topology=self._topo)
+        self._grid = PipelineParallelGrid(process_group=self.world_group, topology=self._topo, custom_pipeline_partition=self.custom_pipeline_partition)
 
         self.stage_id = self._topo.get_coord(self.global_rank).pipe
         
@@ -235,12 +246,15 @@ class PipelineModule(nn.Module):
                 should_checkpoint = self._is_checkpointable(funcs)
                 # Zixian: 11/28/2025: determine whether to uneven pp ckpt 
                 DYNAMIC_CHECKPOINT=os.getenv("DYNAMIC_CHECKPOINT")
-                print (f'{DYNAMIC_CHECKPOINT=}')
-                if DYNAMIC_CHECKPOINT == 'True': 
+                # if self.global_rank % 8 == 0:
+                #     print (f'{DYNAMIC_CHECKPOINT=}')
+                if self.custom_checkpoint_partition != None: 
+                # if DYNAMIC_CHECKPOINT == 'True': 
                     assert self.activation_checkpoint_interval > 0, "[pipe/module.py] Enabling uneven_pp_partitioning + ckpting, but without passing checkpointing arg"
                     
                     # Retrieve partitioning 
-                    self.dynamic_checkpointing_partitions=self._str_to_list (os.getenv ("DYNAMIC_CHECKPOINT_PARTITION"))
+                    # self.dynamic_checkpointing_partitions=self._str_to_list (os.getenv ("DYNAMIC_CHECKPOINT_PARTITION"))
+                    self.dynamic_checkpointing_partitions = self.custom_checkpoint_partition
                     assert self.dynamic_checkpointing_partitions != [], f"{self.dynamic_checkpointing_partitions=}, check if your launch script enabled exporting DYNAMIC_CHECKPOINT_PARTITION"
                     
                     # Assign ckpt partition 
@@ -259,14 +273,17 @@ class PipelineModule(nn.Module):
                             should_checkpoint = False  
                     
                     # Log and verify 
-                    if should_checkpoint:
-                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Enabling checkpointing for layers {start_idx} given {self.dynamic_checkpointing_partitions=}')
-                    else: 
-                        print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Disabling checkpointing for layers {start_idx} given {self.dynamic_checkpointing_partitions=}')
+                    if self.global_rank % 8 == 0: 
+                        if should_checkpoint:
+                            print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Enabling checkpointing for layers {start_idx} given {self.dynamic_checkpointing_partitions=}', flush=True)
+                        else: 
+                            print(f'Zixian Info: [pipe/module.py]: Stage {self.stage_id} - Disabling checkpointing for layers {start_idx} given {self.dynamic_checkpointing_partitions=}', flush=True)
                         
                 self.is_checkpointable_results.append(should_checkpoint)
             self.is_checkpointable_results_interval = self.activation_checkpoint_interval
-        print (f'[pipe/module.py] AFTER calling _precompute_checkpointable_values {self.stage_id=} {self.is_checkpointable_results=} {self.is_checkpointable_results_interval=}')
+        
+        if self.global_rank % 8 == 0: 
+            print (f'[pipe/module.py] AFTER calling _precompute_checkpointable_values {self.stage_id=} {self.is_checkpointable_results=} {self.is_checkpointable_results_interval=}', flush=True)
         
     def _str_to_list(self, input_val) -> List[int]:
         """
@@ -493,8 +510,10 @@ class PipelineModule(nn.Module):
         
         # self.parts = [np.int64(0), np.int64(12), np.int64(23), np.int64(28), 33]
         # self.parts = [np.int64(0), np.int64(5), np.int64(12), np.int64(20), 33]
-        if os.getenv("UNEVEN_PP") == "True": 
-            print (f'{os.getenv("UNEVEN_PP")=}')
+        # if os.getenv("UNEVEN_PP") == "True": 
+        if self.custom_pipeline_partition is not None:
+            # print (f'{os.getenv("UNEVEN_PP")=}')
+            print (f'{self.custom_pipeline_partition=}') 
             # 11/27/2025: Zixian: 50B pp4 test: stage0&1 has 5 layers, stage 2&3 has 7 layers
             #                     5*(4T_g) = 20T_g -- ckpt early layer
             #                     7*(3T_g) = 21T_g -- no-ckpt on later layer
@@ -506,7 +525,8 @@ class PipelineModule(nn.Module):
             # stage last: MixedFusedLayerNorm, EmbeddingPipe, float16_to_fp32
             
             # Read user assigned partitioning
-            self.uneven_pp_partition = self._str_to_list (os.getenv ("UNEVEN_PP_PARTITION"))
+            # self.uneven_pp_partition = self._str_to_list (os.getenv ("UNEVEN_PP_PARTITION"))
+            self.uneven_pp_partition = self.custom_pipeline_partition
             assert self.uneven_pp_partition != [], f"{self.uneven_pp_partition=}, check if your launch script enabled exporting UNEVEN_PP_PARTITION"
             print (f'{self.uneven_pp_partition=}')
             

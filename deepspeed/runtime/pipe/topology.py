@@ -271,7 +271,7 @@ class PipelineParallelGrid:
     for data_parallel_id = 1.
     """
 
-    def __init__(self, topology=None, process_group=None):
+    def __init__(self, topology=None, process_group=None, custom_pipeline_partition=None):
         # TODO use process_group if provided
         self.global_rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -293,6 +293,11 @@ class PipelineParallelGrid:
         self.model_parallel_size = max(self._topo.get_dim('model'), 1)
         self.slice_parallel_size = self.model_parallel_size
         assert self._is_grid_valid(), "Invalid Grid"
+        
+        
+        # Init ELMoE PP ckpt partitions 
+        self.custom_pipeline_partition = custom_pipeline_partition
+        print (f'[deepspeed/runtime/pipe/topology.py] {self.custom_pipeline_partition=}')
 
         self.stage_id = self.get_stage_id()
         self.data_parallel_id = self.get_data_parallel_id()
@@ -434,7 +439,8 @@ class PipelineParallelGrid:
     # These are model parallel groups across all types of model parallelism.
     # Deepspeed uses them to detect overflow, etc.
     def get_model_parallel_rank(self):
-        if os.getenv ("UNEVEN_PP") == "True": 
+        # if os.getenv ("UNEVEN_PP") == "True": 
+        if self.custom_pipeline_partition is not None: 
             # NEW: Use slice (tensor) rank. 
             # If get_slice_parallel_rank() is missing, use logic below:
             if 'model' in self._topo.get_axis_names():
@@ -448,7 +454,8 @@ class PipelineParallelGrid:
         
 
     def get_model_parallel_world_size(self):
-        if os.getenv ("UNEVEN_PP") == "True": 
+        # if os.getenv ("UNEVEN_PP") == "True": 
+        if self.custom_pipeline_partition is not None: 
             # NEW: Use slice (tensor) size (which is 1 in your setup)
             return self.slice_parallel_size
         else: 

@@ -18,19 +18,27 @@ autotune_configs = [
     # K=64, num_warps=4 — primary LDS conflict mitigation + deep pipeline
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
-    # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-    # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-    # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
+
+    # K=64, num_warps=8 — higher throughput when conflicts aren't the bottleneck
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
+
+    # Safe fallback — stages=1 always fits, wins on 537B/1T when aggressive configs OOR
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=4),
+# ]
+    # # K=64, num_warps=4 — primary LDS conflict mitigation + deep pipeline
+    
+    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+    triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+    triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
     # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
 
-    # K=64, num_warps=8 — higher throughput if conflicts aren't the bottleneck
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
-    triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
+    # # # K=64, num_warps=8 — higher throughput if conflicts aren't the bottleneck,
     # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
     # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
 
-    # K=32 — narrower K reduces LDS pressure per access cycle
+    # # K=32 — narrower K reduces LDS pressure per access cycle
     # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
     # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
@@ -41,7 +49,7 @@ autotune_configs = [
     # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
     # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 
-    # K=128 — very wide K, fewest loop iterations, max MFMA reuse per fetch
+    # # K=128 — very wide K, fewest loop iterations, max MFMA reuse per fetch
     # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
     # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
     # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
@@ -52,7 +60,47 @@ autotune_configs = [
     # triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
     # triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     # triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+
+    # Safe fallback — stages=1 always compiles, even when large-model shapes
+    # push aggressive entries above the device's LDS capacity. Triton's
+    # autotuner assigns OutOfResources configs infinite time and auto-picks
+    # this survivor, so 537B / 1T runs switch to it automatically; on 63B /
+    # 173B the aggressive configs above are faster and still win.
+    # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=4),
 ]
+
+
+# ==============================================================================
+# 2. AUTOTUNE CONFIG PRUNER (early_config_prune hook)
+# ==============================================================================
+# For our MoE shapes (hidden=7168 on every shipped model), min(K, D) always
+# resolves to the FFN dim. Empirically:
+#   63B  ffn=1536, 173B ffn=2048  -> full 5-config sweep fits in the per-rank
+#                                    host-RAM budget during Triton compile.
+#   537B ffn=2560, 1T   ffn=2560  -> full sweep triggers cgroup OOM on Frontier
+#                                    (30 compilations per rank, ~2 GB LLVM peak
+#                                    each, 8 ranks per node all compiling in
+#                                    parallel exceeds the ~64 GB per-rank limit).
+#
+# Triton's @triton.autotune calls `early_config_prune` BEFORE benchmarking, and
+# benchmarking is what triggers compilation. Pruned configs are never compiled.
+# So for large-FFN shapes we return only the safe stages=1 entry, cutting the
+# compile storm by ~5x while keeping the full sweep for smaller models.
+#
+# Threshold sits between 173B (2048) and 537B (2560).
+_LARGE_FFN_THRESHOLD = 2200
+
+
+def _prune_for_large_shape(configs, named_args, **kwargs):
+    # The three decorated kernels use different arg names for their problem
+    # dimensions (forward: K/D, backward_dx: IN_DIM/OUT_DIM, backward_dw:
+    # OUT_DIM/IN_DIM). Gather whichever are present; for our MoE shapes
+    # min(dims) == FFN dim regardless of which kernel is being tuned.
+    dims = [named_args[k] for k in ('K', 'D', 'IN_DIM', 'OUT_DIM') if k in named_args]
+    if dims and min(dims) >= _LARGE_FFN_THRESHOLD:
+        return [c for c in configs if c.num_stages == 1]
+    return configs
+
 
 # ==============================================================================
 # 1. INDEX BUILDER
@@ -112,17 +160,17 @@ def build_index_tensors(output_splits_tensor, num_experts):
 # ==============================================================================
 # 3. KERNEL 4v2 (GATHER-SCATTER GEMM)
 # ==============================================================================
-# @triton.autotune(configs=autotune_configs, key=['K', 'D'])
+@triton.autotune(
+    configs=autotune_configs,
+    key=['K', 'D'],
+    prune_configs_by={'early_config_prune': _prune_for_large_shape},
+)
 @triton.jit
 def kernel4v2_forward(
     x_ptr, w_ptr, c_ptr, indices_ptr, expert_starts_ptr, m_sizes_ptr,
     K: tl.constexpr, D: tl.constexpr, NUM_EXPERTS, NUM_SMS: tl.constexpr,
     stride_am, stride_ad, stride_we, stride_wk, stride_wd, stride_cm, stride_ck,
-    # BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr = 128,   # CHANGED: was plain param, now has default
-    BLOCK_SIZE_N: tl.constexpr = 128,   # CHANGED
-    BLOCK_SIZE_K: tl.constexpr = 64,    # CHANGED
-    GROUP_SIZE_M: tl.constexpr = 8,     # CHANGED
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
 ):
     tidx = tl.program_id(0)
     processed_tiles = 0
@@ -162,17 +210,17 @@ def kernel4v2_forward(
             processed_tiles += num_tiles
         expert_idx += 1
 
-# @triton.autotune(configs=autotune_configs, key=['IN_DIM', 'OUT_DIM'])
+@triton.autotune(
+    configs=autotune_configs,
+    key=['IN_DIM', 'OUT_DIM'],
+    prune_configs_by={'early_config_prune': _prune_for_large_shape},
+)
 @triton.jit
 def kernel4v2_backward_dx(
     dy_ptr, w_ptr, dx_ptr, indices_ptr, expert_starts_ptr, m_sizes_ptr,
     IN_DIM: tl.constexpr, OUT_DIM: tl.constexpr, NUM_EXPERTS, NUM_SMS: tl.constexpr,
     stride_dym, stride_dyout, stride_we, stride_wout, stride_win, stride_dxm, stride_dxin,
-    # BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr = 128,   # CHANGED
-    BLOCK_SIZE_K: tl.constexpr = 128,   # CHANGED
-    BLOCK_SIZE_N: tl.constexpr = 64,    # CHANGED
-    GROUP_SIZE_M: tl.constexpr = 8,     # CHANGED
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
 ):
     tidx = tl.program_id(0)
     processed_tiles = 0
@@ -212,17 +260,17 @@ def kernel4v2_backward_dx(
             processed_tiles += num_tiles
         expert_idx += 1
 
-# @triton.autotune(configs=autotune_configs, key=['OUT_DIM', 'IN_DIM'])
+@triton.autotune(
+    configs=autotune_configs,
+    key=['OUT_DIM', 'IN_DIM'],
+    prune_configs_by={'early_config_prune': _prune_for_large_shape},
+)
 @triton.jit
 def kernel4v2_backward_dw(
     x_ptr, dy_ptr, dw_ptr, indices_ptr, expert_starts_ptr, m_sizes_ptr,
     OUT_DIM: tl.constexpr, IN_DIM: tl.constexpr, NUM_EXPERTS, NUM_SMS: tl.constexpr,
     stride_am, stride_ain, stride_dym, stride_dyout, stride_we, stride_wout, stride_win,
-    # BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr = 128,   # CHANGED
-    BLOCK_SIZE_K: tl.constexpr = 128,   # CHANGED
-    BLOCK_SIZE_M: tl.constexpr = 64,    # CHANGED
-    GROUP_SIZE_M: tl.constexpr = 8,     # CHANGED
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
 ):
     tidx = tl.program_id(0)
     num_n_tiles      = tl.cdiv(OUT_DIM, BLOCK_SIZE_N)
@@ -270,7 +318,6 @@ class Kernel4v2_GEMM(torch.autograd.Function):
                 OUT_DIM, IN_DIM, E, NUM_SMS,
                 inputs.stride(0), inputs.stride(1), weights.stride(0), weights.stride(1), weights.stride(2),
                 output.stride(0), output.stride(1),
-                num_warps=4, num_stages=1,   # <-- ADD THIS
             )
         ctx.save_for_backward(inputs, weights, d_indices, d_expert_starts, d_m_sizes)
         return output
@@ -289,14 +336,12 @@ class Kernel4v2_GEMM(torch.autograd.Function):
                 IN_DIM, OUT_DIM, E, NUM_SMS,
                 grad_output.stride(0), grad_output.stride(1), weights.stride(0), weights.stride(1), weights.stride(2),
                 grad_inputs.stride(0), grad_inputs.stride(1),
-                num_warps=4, num_stages=1,   # CHANGED: added these two args
             )
             kernel4v2_backward_dw[(NUM_SMS,)](
                 inputs, grad_output, grad_weights, d_indices, d_expert_starts, d_m_sizes,
                 OUT_DIM, IN_DIM, E, NUM_SMS,
                 inputs.stride(0), inputs.stride(1), grad_output.stride(0), grad_output.stride(1),
                 grad_weights.stride(0), grad_weights.stride(1), grad_weights.stride(2),
-                num_warps=4, num_stages=1,   # <-- ADD THIS
             )
         else:
             grad_weights.zero_()

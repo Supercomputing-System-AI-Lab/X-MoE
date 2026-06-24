@@ -220,8 +220,8 @@ class MOEv2Layer(Base):
         return dist.get_rank() // bwc_tensor_model_parallel_world_size(groups.mpu) % self.ep_size 
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
-        
-        print (f'inside moe forward')
+
+        # print (f'inside moe forward')
         import os
         rank = os.getenv ('RANK')
         self.wall_clock_breakdown = os.getenv ("WALL_CLOCK_BREAKDOWN")=="true"

@@ -151,11 +151,7 @@ class MemoryPredictor:
         dp_non_moe = ep  
         per_gpu_max_assigned_tokens = b * s * dp_non_moe * topk / num_experts * num_experts_per_gpu #* c 
         
-        # print (f'{per_gpu_max_assigned_tokens=}')
-        
-        # drop_factor = 0.65
-        # 0.50 + 512/8/2 * 0.003
-        drop_factor = 0.5 + num_experts_per_gpu * 0.003
+        drop_factor = 0.5 + num_experts_per_gpu * 0.004
         per_gpu_max_assigned_tokens = per_gpu_max_assigned_tokens * drop_factor
         
         

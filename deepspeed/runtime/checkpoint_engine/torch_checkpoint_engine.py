@@ -25,7 +25,11 @@ class TorchCheckpointEngine(CheckpointEngine):
 
     def load(self, path: str, map_location=None):
         logger.info(f"[Torch] Loading checkpoint from {path}...")
-        partition = torch.load(path, map_location=map_location)
+        # weights_only=False: PyTorch 2.6+ flipped the default to True for
+        # security, but DeepSpeed checkpoints contain non-tensor objects
+        # (optimizer state, scheduler, RNG dicts), which weights_only refuses.
+        # Safe here: we're loading our own checkpoints.
+        partition = torch.load(path, map_location=map_location, weights_only=False)
         logger.info(f"[Torch] Loaded checkpoint from {path}.")
         return partition
 

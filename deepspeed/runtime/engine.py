@@ -2039,6 +2039,15 @@ class DeepSpeedEngine(Module):
 
         assert self.optimizer is not None and not isinstance(self.optimizer, DummyOptim), \
             "must provide optimizer during init in order to use backward"
+            
+        # Fix: sync all ranks before backward to prevent NCCL collective ordering mismatch
+        # in multi-node ZeRO-3. Without this, ranks on different nodes enter loss.backward()
+        # at different times, causing ZeRO-3's all_gather/reduce_scatter operations to deadlock.
+        # See: https://github.com/microsoft/DeepSpeed/issues/XXXX
+        # Zixian: 06/02/2026: Including the if to prevent deadlock when PP is enabled. 
+        if self.zero_optimization_partition_weights() and not self.is_pipe_paralle:
+            get_accelerator().synchronize()
+            dist.barrier()
 
         self._start_timers(self.engine_timers.backward_inner_timers)
 

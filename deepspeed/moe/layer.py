@@ -10,7 +10,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepspeed.utils import groups, log_dist
-from .experts import Experts, FusedExperts_Primus, FusedExperts_Triton
+# IMPLEMENTING SHARED EXPERT -- Changed: added SharedExpert to this import.
+from .experts import Experts, FusedExperts_Primus, FusedExperts_Triton, SharedExpert
 from .sharded_moe import MOELayer, UnblancedMOELayer, TopKGate, see_memory_usage
 from .moe_v2 import MOEv2Layer, TopKGatev2
 from .moe_rbd import TopKGateRBD, MOEv2LayerRBD
@@ -78,6 +79,9 @@ class MoE(nn.Module):
                  use_groupedGEMM: bool = False,
                  use_triton: bool = False,
                  rbd_mesh_size: int = 8,
+                 # IMPLEMENTING SHARED EXPERT -- Added: pre-built wider dense MLP for the
+                 # shared expert (built in transformer.py). None => no shared expert.
+                 shared_expert: Optional[nn.Module] = None,
                  ) -> None:
 
         super(MoE, self).__init__()
@@ -188,6 +192,15 @@ class MoE(nn.Module):
             # coefficient is used for weighted sum of the output of expert and mlp
             self.coefficient = nn.Linear(hidden_size, 2)
 
+        # ===== IMPLEMENTING SHARED EXPERT =====
+        #   Added: self.shared_experts (built only when num_shared_experts > 0 and a
+        #   shared_expert module was passed in). Wraps a single wider MLP whose
+        #   params stay UNTAGGED -> replicated/data-parallel like attention.
+        # ===== END SHARED EXPERT =====
+        self.shared_experts = None
+        if self.num_shared_experts and self.num_shared_experts > 0 and shared_expert is not None:
+            self.shared_experts = SharedExpert(shared_expert)
+
     def set_deepspeed_parallelism(self, use_data_before_expert_parallel_: bool = False) -> None:
         self._create_process_groups(use_data_before_expert_parallel_=use_data_before_expert_parallel_)
 
@@ -247,6 +260,16 @@ class MoE(nn.Module):
         # see_memory_usage("after MoE", force=SEE_MEMORY) 
         # torch.cuda.memory._dump_snapshot("/lustre/orion/gen150/scratch/pinaster/moe-arch/system-benchmark/deepseek-style/profile/moe-layer.pickle")
         # torch.cuda.memory._record_memory_history(enabled=None)
+        # ===== IMPLEMENTING SHARED EXPERT =====
+        #   Added: sum the shared-expert output (run on ALL tokens) into the routed
+        #   output. `output` from deepspeed_moe is already back in full (hidden_states)
+        #   token space, so this add is shape-consistent. Matches HF DeepSeek:
+        #       hidden_states = routed_experts(x) + shared_experts(x)
+        # ===== END SHARED EXPERT =====
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(hidden_states)
+            # print (f"[moe/layer.py] AFTER shared_expert")
+
         if self.use_residual:
             # Residual MoE
             output_mlp = self.mlp(hidden_states)

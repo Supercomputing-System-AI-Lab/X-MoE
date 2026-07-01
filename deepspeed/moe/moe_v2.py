@@ -348,6 +348,7 @@ class MOEv2Layer(Base):
                     expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
         
             # If using triton groupgemm 
+            # Zixian: TODO: change the following if to use "use_triton" and "use_groupgemm" 
             if os.getenv ("USE_TRITON_GROUPGEMM") == 'True': 
                 # print ("USING TRITON GROUPGEMM")
                 if self.wall_clock_breakdown:

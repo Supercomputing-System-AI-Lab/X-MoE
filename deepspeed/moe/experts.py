@@ -73,6 +73,42 @@ class Experts(nn.Module):
                 i += 1
             return torch.cat(expert_outputs, dim=0)
 
+
+# ============================================================================
+# IMPLEMENTING SHARED EXPERT
+#   Added: SharedExpert class.   Changed: none.   Removed: none.
+#
+# A DeepSeek-style "shared expert" is a SINGLE dense (SwiGLU) MLP that processes
+# EVERY token locally (NO routing, NO chunking, NO all-to-all) and is summed with
+# the routed experts' output:   y = routed_experts(x) + shared_expert(x).
+#
+# Unlike routed experts (Experts / FusedExperts_*), its parameters are REPLICATED
+# on every EP/DP rank exactly like the attention layer. Therefore we MUST NOT tag
+# them with `param.allreduce = False` / `param.group_name`. Leaving them untagged
+# makes is_moe_param() return False (see deepspeed/moe/utils.py), so their gradients
+# flow through the standard FULL data-parallel all-reduce
+# (deepspeed/runtime/engine.py::_reduce_non_expert_gradients) and ZeRO partitions
+# their optimizer state over the full DP group -- identical to attention weights.
+# ============================================================================
+class SharedExpert(nn.Module):
+
+    def __init__(self, shared_mlp: nn.Module) -> None:
+        super(SharedExpert, self).__init__()
+        # `shared_mlp` is a pre-built dense MLP (Megatron ParallelMLP) whose FFN width
+        # is moe_intermediate_size * num_shared_experts. It is constructed on the caller
+        # side (megatron/model/transformer.py) where ParallelMLP + config are available.
+        # NOTE: we intentionally do NOT touch param.allreduce / param.group_name here.
+        self.shared_mlp = shared_mlp
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        out = self.shared_mlp(hidden_states)
+        # Megatron ParallelMLP returns (output, output_bias) because of skip_bias_add.
+        if isinstance(out, tuple):
+            out, out_bias = out
+            if out_bias is not None:
+                out = out + out_bias
+        return out
+
 class FusedExperts_Primus(nn.Module):
     def __init__(self, expert: nn.Module, config, num_local_experts: int = 1, expert_group_name: Optional[str] = None, is_uneven_tokens = False) -> None:
         super(FusedExperts_Primus, self).__init__()

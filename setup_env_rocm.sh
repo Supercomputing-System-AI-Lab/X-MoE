@@ -3,15 +3,35 @@
 # setup_env_rocm.sh — ELMoE reviewer reproduction environment (AMD / Frontier)
 #
 # Builds the full ELMoE software stack on Frontier (ROCm 6.4.1, gfx90a).
-# Run from inside the X-MoE repo. Third-party sources are cloned into a sibling
-# ELMoE_deps/ folder (NOT inside the repo, to keep the checkout clean).
+# AMD counterpart of setup_env_cuda.sh — same layout, same one knob, same stages.
 #
-#   X-MoE/            <- this repo (contains this script)
-#   ELMoE_deps/       <- apex + flash-attention sources (created here)
+# ---------------------------------------------------------------------------
+# WHERE THINGS GO — one knob: ELMOE_ROOT
+#
+#   ELMOE_ROOT=/lustre/orion/<proj>/proj-shared/$USER/elmoe ./setup_env_rocm.sh
+#
+# That single variable relocates EVERYTHING this script writes:
+#
+#   $ELMOE_ROOT/ELMoE_envs/ELMoE-ROCM6.4.1_repro   conda environment (~20 GB)
+#   $ELMOE_ROOT/ELMoE_deps/                        apex + flash-attn (+ aws-ofi-rccl)
+#   $ELMOE_ROOT/ELMoE_cache/                       pip + conda caches (these get big)
+#
+# Defaults to one level ABOVE the X-MoE checkout, so a repo at <dir>/X-MoE puts
+# them alongside it as siblings — nothing large is ever written inside the repo.
+#
+# ON OLCF, PUT THIS ON LUSTRE, NOT $HOME:
+#   * /ccs/home has a 50 GB quota that is typically almost full — a 20 GB env
+#     will not fit, and NFS is the wrong filesystem for a conda env anyway
+#     (thousands of ranks importing Python hammer its metadata server).
+#   * /lustre/orion/<proj>/scratch IS PURGED (files untouched for a while are
+#     deleted). Use proj-shared or world-shared, which are not purged:
+#         /lustre/orion/<proj>/proj-shared/$USER/elmoe
+#   The script checks free space (and your quota) UP FRONT and refuses to start
+#   if there is not room, rather than dying 20 GB into the torch install.
 #
 # ---------------------------------------------------------------------------
 # USAGE
-#   ./setup_env_rocm.sh            # run ALL stages EXCEPT primus (see below)
+#   ./setup_env_rocm.sh            # run ALL stages EXCEPT the two below
 #   ./setup_env_rocm.sh <stage>    # run a single stage (re-run one on failure)
 #
 #   stages:  conda  torch  apex  mpi4py  flashattn  xmoe  verify
@@ -21,18 +41,22 @@
 #     ./setup_env_rocm.sh aws-ofi-rccl   # Slingshot RCCL plugin -> ELMoE_deps/.
 #                                        # Frontier-only; skip on non-Frontier systems.
 #                                        # Prints the exports you must set afterward.
-#     ./setup_env_rocm.sh primus         # calibrated primus_turbo backend
+#                                        # (NVIDIA equivalent: the DLAMI preinstalls
+#                                        #  aws-ofi-nccl — see setup_env_cuda.sh efa)
+#     ./setup_env_rocm.sh primus         # calibrated primus_turbo backend.
+#                                        # AMD-only (Composable Kernel); on NVIDIA use
+#                                        # ELMoE's Triton grouped-GEMM instead.
 #
 # PREREQUISITE (do this once, by hand — it is how you got this script):
 #   module reset
 #   module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 \
 #               craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja/1.12.1.lua
-#   cd ~ && git clone https://github.com/Supercomputing-System-AI-Lab/X-MoE.git
-#   # (for the ELMoE branch: git clone -b ELMoE https://github.com/.../X-MoE.git)
+#   cd /lustre/orion/<proj>/proj-shared/$USER            # NOT ~ — see above
+#   git clone -b ELMoE --single-branch https://github.com/Supercomputing-System-AI-Lab/X-MoE.git
 #   cd X-MoE && ./setup_env_rocm.sh
 #
-# OVERRIDES (env vars): ENV_PREFIX, DEPS_DIR, MAX_JOBS, APEX_GIT_REF,
-#                       LIBFABRIC_PATH, GCC_NATIVE_BIN, RUNTIME_ENV_FILE
+# OVERRIDES: ELMOE_ROOT, ENV_PREFIX, DEPS_DIR, CACHE_DIR, MAX_JOBS, APEX_GIT_REF,
+#            LIBFABRIC_PATH, GCC_NATIVE_BIN, RUNTIME_ENV_FILE, MIN_FREE_GB
 ###############################################################################
 
 set -euo pipefail
@@ -40,13 +64,36 @@ set -euo pipefail
 # --- resolve paths ---------------------------------------------------------
 XMOE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- user-tunable configuration --------------------------------------------
-# Conda env location. Reviewers: override with `ENV_PREFIX=/your/path ./setup_env_rocm.sh`.
-ENV_PREFIX="${ENV_PREFIX:-$HOME/envs/ELMoE-ROCM6.4.1_repro}"
+# --- the one knob ----------------------------------------------------------
+# Default: the directory ONE LEVEL ABOVE the X-MoE checkout, so a repo at
+# <dir>/X-MoE puts env, deps and caches alongside it as siblings:
+#
+#   <dir>/X-MoE/          <- the repo (this script lives here)
+#   <dir>/ELMoE_envs/     <- conda environment
+#   <dir>/ELMoE_deps/     <- apex + flash-attn (+ aws-ofi-rccl) sources
+#   <dir>/ELMoE_cache/    <- pip + conda caches
+#
+# Identical layout to setup_env_cuda.sh. Override to relocate everything at once.
+ELMOE_ROOT="${ELMOE_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"
+
+# Each derives from ELMOE_ROOT but stays independently overridable.
+ENV_PREFIX="${ENV_PREFIX:-$ELMOE_ROOT/ELMoE_envs/ELMoE-ROCM6.4.1_repro}"
+DEPS_DIR="${DEPS_DIR:-$ELMOE_ROOT/ELMoE_deps}"
+CACHE_DIR="${CACHE_DIR:-$ELMOE_ROOT/ELMoE_cache}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 
-# Third-party sources live OUTSIDE the repo, in a sibling ELMoE_deps/ folder.
-DEPS_DIR="${DEPS_DIR:-$(cd "$XMOE_ROOT/.." && pwd)/ELMoE_deps}"
+# Keep the fat caches off $HOME. This is NOT cosmetic on OLCF: pip caches the
+# ~2.5 GB torch wheel and conda unpacks GBs of packages, and both default to
+# $HOME (~/.cache/pip, ~/.conda/pkgs) — where the 50 GB quota is typically
+# almost exhausted. Without these three lines the build blows the home quota
+# even when ENV_PREFIX points at Lustre.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$CACHE_DIR/pip}"
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_DIR/conda}"
+export TMPDIR="${TMPDIR:-$CACHE_DIR/tmp}"
+
+# Free space required under ELMOE_ROOT, checked BEFORE any stage runs. Measured:
+# conda env ~20 GB + caches ~4 GB, peaking higher during the apex/flash-attn build.
+MIN_FREE_GB="${MIN_FREE_GB:-25}"
 
 # Pinned versions (reproduction targets).
 APEX_VERSION="1.11.0"          # verified after build; warns on drift
@@ -90,6 +137,78 @@ fi' EXIT
 # shared setup: modules + conda activation (run at the start of every stage so
 # a single stage can be re-run in a fresh shell)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# preflight_space — fail loudly BEFORE building, not 20 GB into a torch install.
+# Checks free space on the filesystem that will hold the target dir (walking up to
+# the nearest existing parent, since the dir itself may not exist yet).
+# ---------------------------------------------------------------------------
+# Remaining USER QUOTA in GiB on the filesystem holding $HOME, or empty if there is
+# no quota. On a quota'd filesystem (e.g. OLCF /ccs/home, 50 GB) `df` reports the
+# whole filesystem's free space — 7.7 TB — which is meaningless to the user, so we
+# must consult the quota instead or the check silently passes.
+home_quota_free_gib() {
+    command -v quota >/dev/null 2>&1 || return 0
+    quota -s 2>/dev/null | awk '
+        # rows: <used> <soft> <hard> ...  e.g. "46816M  51200M  51200M"
+        function to_gib(v,   u, n) {
+            u = substr(v, length(v)); n = substr(v, 1, length(v)-1) + 0
+            if (u == "K") return n/1048576; if (u == "M") return n/1024
+            if (u == "G") return n;         if (u == "T") return n*1024
+            return (v + 0)/1073741824       # plain bytes
+        }
+        $1 ~ /^[0-9]+[KMGT]?$/ && $2 ~ /^[0-9]+[KMGT]?$/ {
+            used = to_gib($1); lim = to_gib($2)
+            if (lim > 0) { printf "%d\n", (lim - used); exit }
+        }'
+}
+
+# Free space in GiB for a path that may not exist yet (walk up to the nearest
+# existing parent). If the path lives on the same filesystem as $HOME, take the
+# MIN of df-free and the user's remaining quota.
+free_gib() {
+    local d="$1"
+    while [ ! -d "$d" ] && [ "$d" != "/" ]; do d="$(dirname "$d")"; done
+    local dffree
+    dffree="$(df -BG --output=avail "$d" 2>/dev/null | tail -1 | tr -dc '0-9')"
+
+    if [ "$(stat -c %d "$d" 2>/dev/null)" = "$(stat -c %d "$HOME" 2>/dev/null)" ]; then
+        local q; q="$(home_quota_free_gib)"
+        if [ -n "$q" ] && { [ -z "$dffree" ] || [ "$q" -lt "$dffree" ]; }; then
+            echo "$q"; return 0
+        fi
+    fi
+    echo "$dffree"
+}
+
+check_space() {
+    local avail; avail="$(free_gib "$ELMOE_ROOT")"
+    info "free space at ELMOE_ROOT=${ELMOE_ROOT}: ${avail:-?} GB (need >= ${MIN_FREE_GB} GB)"
+
+    case "$ELMOE_ROOT" in
+        "$HOME"/*|"$HOME"|/ccs/home/*)
+            warn "ELMOE_ROOT is under your NFS home. It is small (50 GB quota on OLCF) and"
+            warn "is the wrong filesystem for a conda env — thousands of ranks importing"
+            warn "Python hammer its metadata server. Use a parallel filesystem." ;;
+    esac
+
+    if [ -n "$avail" ] && [ "$avail" -lt "$MIN_FREE_GB" ]; then
+        printf "\n${C_ERR}[FAILED]${C_OFF} only %s GB free (or left in quota) on the filesystem holding\n" "$avail" >&2
+        printf "         ELMOE_ROOT=%s  (need >= %s GB).\n" "$ELMOE_ROOT" "$MIN_FREE_GB" >&2
+        cat >&2 <<EOF
+
+         The full stack needs ~25 GB (a ~20 GB conda env plus pip/conda caches).
+         Point ELMOE_ROOT at a bigger filesystem. On OLCF use a NON-PURGED
+         Lustre area (scratch IS purged; /ccs/home is quota-limited):
+
+             ELMOE_ROOT=/lustre/orion/<proj>/proj-shared/\$USER/elmoe ./setup_env_rocm.sh
+
+         Aborting before any build. Nothing was installed.
+EOF
+        exit 1
+    fi
+    ok "check_space: enough room."
+}
+
 ensure_module_cmd() {
     if ! type module >/dev/null 2>&1; then
         source /etc/profile.d/lmod.sh 2>/dev/null \
@@ -127,6 +246,8 @@ activate_env() {
 # ---------------------------------------------------------------------------
 stage_conda() {
     CURRENT_STAGE="conda"; banner "conda env ($ENV_PREFIX, python $PYTHON_VERSION)"
+    check_space
+    mkdir -p "$ELMOE_ROOT" "$DEPS_DIR" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$TMPDIR"
     load_modules
     conda_hook
     if [ -d "$ENV_PREFIX" ]; then
@@ -314,9 +435,18 @@ PY
 # dispatch
 # ---------------------------------------------------------------------------
 run_all() {
-    banner "FULL SETUP (all stages except primus)"
-    info "env:   $ENV_PREFIX"
-    info "deps:  $DEPS_DIR"
+    banner "FULL SETUP (all stages except aws-ofi-rccl / primus)"
+    # Echo every resolved path and pin, so a reviewer sees exactly what their
+    # overrides produced before a long build starts.
+    info "repo:       $XMOE_ROOT"
+    info "ELMOE_ROOT: $ELMOE_ROOT"
+    info "env:        $ENV_PREFIX"
+    info "deps:       $DEPS_DIR"
+    info "cache:      $CACHE_DIR"
+    info "versions:   python $PYTHON_VERSION | torch (rocm6.4 index) | apex $APEX_VERSION | flash-attn $FLASH_ATTN_TAG"
+    info "build:      MAX_JOBS=$MAX_JOBS | need ${MIN_FREE_GB}GB free"
+    # Fail fast: check disk BEFORE the first stage, not 20 GB into the torch install.
+    check_space
     local stages=(conda torch apex mpi4py flashattn xmoe verify)
     local n=${#stages[@]} i=0
     for s in "${stages[@]}"; do
@@ -343,7 +473,7 @@ case "$STAGE" in
     primus)                 stage_primus ;;
     verify)                 stage_verify ;;
     -h|--help|help)
-        sed -n '2,40p' "$0" | sed 's/^#//; s/^ //'
+        sed -n '3,59p' "$0" | sed 's/^#//; s/^ //'
         ;;
     *)
         trap - EXIT   # not a stage failure — suppress the resume hint

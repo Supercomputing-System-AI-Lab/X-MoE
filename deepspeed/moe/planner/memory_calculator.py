@@ -3,6 +3,50 @@ import numpy as np
 from typing import Dict, Optional, List
 import matplotlib.patches as mpatches
 import math
+import os
+
+# Binary GiB — MUST match MemoryPredictor.GIGA below. The planner's whole memory
+# model is in GiB, so a decimal-GB conversion here would be a silent ~7% error.
+_GIB = 1024 ** 3
+
+
+def detect_total_memory_gib():
+    """Total memory of THIS rank's GPU, in GiB. Returns None if it cannot be determined.
+
+    Used to derive the planner's memory limit as (total - headroom) instead of a
+    hardcoded constant. Two properties are essential and easy to get wrong:
+
+    1. DETERMINISM ACROSS RANKS. The planner runs on EVERY rank (see ELMoE_launch.py),
+       and all ranks must derive the SAME limit or they would compute different layer
+       partitions and the run would corrupt. We therefore read *total* memory — a
+       static hardware constant, identical on homogeneous nodes — and never free/
+       available memory, which varies per rank and would diverge.
+
+    2. DO NOT CREATE A CONTEXT ON THE WRONG GPU. torch.cuda.get_device_properties()
+       triggers a lazy CUDA/HIP init. Without pinning the device first, every local
+       rank would create a primary context on GPU 0 (~0.3-0.5 GB each), wasting
+       several GB on that one GPU. So we set_device(local_rank) FIRST. Megatron pins
+       the same device later anyway, so this only moves the context creation earlier
+       onto the correct device.
+
+    local_rank is read launcher-agnostically: under srun the batch script's
+    LOCAL_RANK export is not the per-task value, so SLURM_LOCALID is the fallback.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        local_rank = int(os.environ.get('LOCAL_RANK')
+                         or os.environ.get('SLURM_LOCALID')
+                         or 0)
+        if local_rank >= torch.cuda.device_count():
+            local_rank = 0
+        torch.cuda.set_device(local_rank)   # pin BEFORE querying — see (2) above
+        return torch.cuda.get_device_properties(local_rank).total_memory / _GIB
+    except Exception as e:  # no GPU, driver error, torch missing — caller falls back
+        print(f"[planner] WARNING: could not detect GPU memory ({type(e).__name__}: {e})")
+        return None
+
 
 class MemoryPredictor:
     """

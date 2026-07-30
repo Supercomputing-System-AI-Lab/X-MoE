@@ -118,10 +118,15 @@ class TopKGatev2(Module):
                  use_rts: bool = True,
                  ep_group: Union[torch.distributed.ProcessGroup, None] = None,
                  top2_2nd_expert_sampling: bool = True,
+                 softmax_before_topk: bool = False,
                  ) -> None:
         super().__init__()
 
         self.wg = torch.nn.Linear(model_dim, num_experts, bias=False)
+        # False (default) -> expert_weights are raw logits (X-MoE behavior).
+        # True -> top-k over softmax probs, so expert_weights are probabilities, matching
+        # HF DeepSeek's MoEGate. Needed to load HF MoE checkpoints.
+        self.softmax_before_topk = softmax_before_topk
         self.ep_group = ep_group
         self.k = k
         self.capacity_factor = capacity_factor
@@ -154,7 +159,8 @@ class TopKGatev2(Module):
 
         gate_output = topkgating_unbalanced(logits, self.k,
                                 self.capacity_factor if self.training else self.eval_capacity_factor,
-                                self.min_capacity, self.drop_tokens, self.ep_group, use_pft=use_pft)
+                                self.min_capacity, self.drop_tokens, self.ep_group, use_pft=use_pft,
+                                softmax_before_topk=self.softmax_before_topk)
 
         if self.wall_clock_breakdown:
             self.timers(TOPK_GATE_TIMER).stop()

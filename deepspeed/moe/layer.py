@@ -60,6 +60,7 @@ class MoE(nn.Module):
                  expert: nn.Module,
                  num_experts: int = 1,
                  num_shared_experts: int = 0,
+                 softmax_before_topk: bool = False,
                  ep_size: int = 1,
                  k: int = 1,
                  capacity_factor: float = 1.0,
@@ -146,7 +147,9 @@ class MoE(nn.Module):
         if use_rbd:
             gate = TopKGateRBD(**gate_params, use_rbd=True)
         elif use_uneven_all2all:
-            gate = TopKGatev2(**gate_params)
+            # Passed only here: TopKGateRBD/TopKGate do not take this kwarg, and this is
+            # the path X-MOE actually uses (--use-uneven-all-to-all).
+            gate = TopKGatev2(**gate_params, softmax_before_topk=softmax_before_topk)
         else:
             gate = TopKGate(**gate_params, use_uneven_all2all=use_uneven_all2all)
 

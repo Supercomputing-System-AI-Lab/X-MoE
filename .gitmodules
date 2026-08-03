@@ -1,7 +1,7 @@
 [submodule "Megatron-DeepSpeed-X-MoE"]
 	path = Megatron-DeepSpeed-X-MoE
 	url = https://github.com/Supercomputing-System-AI-Lab/Megatron-DeepSpeed.git
-	branch = x-moe
+	branch = ELMoE
 [submodule "primus_turbo"]
 	path = primus_turbo
 	url = https://github.com/HenryJlh/Primus-Turbo.git

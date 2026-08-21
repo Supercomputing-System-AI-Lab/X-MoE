@@ -96,16 +96,27 @@ stage_preflight() {
     # does not exist. Saying only "scripts dir not found" sends people off to run the
     # 40-minute setup_env_cuda.sh (which does happen to init it, at stage_xmoe) when a
     # 10-second submodule init is all that is needed. Name the actual cause.
+    # A plain `git clone` (no --recursive) leaves the submodule empty, so $SCRIPTS does
+    # not exist. Do NOT make --recursive a hard requirement: the published AE notes use a
+    # plain clone, and setup_env_cuda.sh already initializes this submodule itself at
+    # stage_xmoe. Doing it here too is consistent, and saves the reviewer from an error
+    # whose obvious-looking fix ("run setup_env_cuda.sh") costs 40 minutes.
+    #
+    # ONLY this submodule: primus_turbo is AMD/Composable-Kernel-only and must stay
+    # uninitialized on NVIDIA.
     if [ ! -d "$SCRIPTS" ]; then
         if [ -d "$XMOE_ROOT/.git" ] && [ -z "$(ls -A "$XMOE_ROOT/Megatron-DeepSpeed-X-MoE" 2>/dev/null)" ]; then
-            warn "the Megatron-DeepSpeed-X-MoE submodule is not initialized (empty dir)."
-            warn "This is NOT a missing conda env -- do not run setup_env_cuda.sh for it."
-            warn "Run this first (only that submodule; primus_turbo is AMD-only and must"
-            warn "stay uninitialized on NVIDIA):"
-            warn "    cd $XMOE_ROOT && git submodule update --init --recursive Megatron-DeepSpeed-X-MoE"
-            die "submodule not initialized"
+            info "Megatron-DeepSpeed-X-MoE submodule is empty (plain clone) — auto-initializing it now."
+            if ( cd "$XMOE_ROOT" && git submodule update --init --recursive Megatron-DeepSpeed-X-MoE ) >/dev/null 2>&1; then
+                ok "submodule initialized ($(cd "$XMOE_ROOT" && git rev-parse --short HEAD:Megatron-DeepSpeed-X-MoE 2>/dev/null))"
+            else
+                warn "automatic 'git submodule update --init' failed (no network? no credentials?)."
+                warn "Run it by hand, then re-run this stage:"
+                warn "    cd $XMOE_ROOT && git submodule update --init --recursive Megatron-DeepSpeed-X-MoE"
+                die "submodule not initialized"
+            fi
         fi
-        die "scripts dir not found: $SCRIPTS"
+        [ -d "$SCRIPTS" ] || die "scripts dir not found: $SCRIPTS"
     fi
 
     local n1g; n1g=$(nvidia-smi -L 2>/dev/null | wc -l)
@@ -411,6 +422,19 @@ case "$STAGE" in
         stage_nfs
         stage_envfile
         stage_hostfile
+        # smoke is the only stage that needs torch. Rather than dying with a confusing
+        # error when 'all' is run before the env is built, do every other stage and say
+        # plainly that the cluster is wired but NOT yet proven. Silently skipping would
+        # be worse than failing: "all succeeded" must never imply an unvalidated cluster.
+        if [ ! -d "$ENV_PREFIX" ]; then
+            banner "WIRING COMPLETE, NOT YET VALIDATED"
+            warn "Skipped the NCCL smoke test: no conda env at $ENV_PREFIX yet."
+            warn "The cluster is wired (ssh + NFS + env.sh + hostfile) but UNPROVEN."
+            info "Build the env, then re-run this to validate:"
+            info "    ./setup_env_cuda.sh"
+            info "    ./setup_2node_aws.sh all $NODE2"
+            exit 0
+        fi
         stage_smoke || die "smoke test failed — do not start training until this passes"
         banner "2-node cluster ready"
         info "Next:  cd $SCRIPTS && bash autorun.sh"

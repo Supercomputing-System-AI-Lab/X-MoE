@@ -92,7 +92,21 @@ stage_preflight() {
         warn "  'envfile' will detect and use the real one; just be aware env.sh will point"
         warn "  outside \$ELMOE_ROOT, so that path must exist on EVERY node too."
     fi
-    [ -d "$SCRIPTS" ]    || die "scripts dir not found: $SCRIPTS"
+    # A fresh `git clone` without --recursive leaves the submodule empty, so $SCRIPTS
+    # does not exist. Saying only "scripts dir not found" sends people off to run the
+    # 40-minute setup_env_cuda.sh (which does happen to init it, at stage_xmoe) when a
+    # 10-second submodule init is all that is needed. Name the actual cause.
+    if [ ! -d "$SCRIPTS" ]; then
+        if [ -d "$XMOE_ROOT/.git" ] && [ -z "$(ls -A "$XMOE_ROOT/Megatron-DeepSpeed-X-MoE" 2>/dev/null)" ]; then
+            warn "the Megatron-DeepSpeed-X-MoE submodule is not initialized (empty dir)."
+            warn "This is NOT a missing conda env -- do not run setup_env_cuda.sh for it."
+            warn "Run this first (only that submodule; primus_turbo is AMD-only and must"
+            warn "stay uninitialized on NVIDIA):"
+            warn "    cd $XMOE_ROOT && git submodule update --init --recursive Megatron-DeepSpeed-X-MoE"
+            die "submodule not initialized"
+        fi
+        die "scripts dir not found: $SCRIPTS"
+    fi
 
     local n1g; n1g=$(nvidia-smi -L 2>/dev/null | wc -l)
     [ "$n1g" -gt 0 ] && ok "node1 GPUs: $n1g" || { warn "node1: nvidia-smi found no GPUs"; fail=1; }
@@ -162,7 +176,23 @@ stage_sshkey() {
     grep -qF "$(cut -d' ' -f2 ~/.ssh/id_ed25519.pub)" ~/.ssh/authorized_keys 2>/dev/null \
         || cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
-    ssh $SSH_OPTS "$NODE1" true 2>/dev/null && ok "node1 -> node1 ok" || warn "node1 -> node1 FAILED"
+    # sshd's StrictModes refuses public-key auth when $HOME or ~/.ssh is group- or
+    # world-writable, with only "Permission denied (publickey)" to go on -- which looks
+    # like a missing key, not a permissions problem. Some AMIs ship $HOME as drwxrwxr-x.
+    # This bites node1->node1 specifically: the launcher ssh's to EVERY host in the
+    # hostfile including itself, so the run dies at launch even though node2 is fine.
+    if [ -n "$(find "$HOME" -maxdepth 0 -perm -g+w -o -maxdepth 0 -perm -o+w 2>/dev/null)" ]; then
+        warn "\$HOME is group/world-writable ($(stat -c '%A' "$HOME")); sshd will refuse key auth."
+        chmod go-w "$HOME" && ok "fixed: $HOME is now $(stat -c '%A' "$HOME")"
+    fi
+    chmod go-w "$HOME/.ssh" 2>/dev/null
+    if ssh $SSH_OPTS "$NODE1" true 2>/dev/null; then
+        ok "node1 -> node1 ok"
+    else
+        die "node1 -> node1 ssh FAILED. The launcher ssh's to every host in the hostfile,
+     itself included, so this must work. Check: chmod go-w ~ ~/.ssh, and that
+     ~/.ssh/authorized_keys contains ~/.ssh/id_ed25519.pub."
+    fi
 
     if ssh $SSH_OPTS "$NODE2" true 2>/dev/null; then
         ok "node1 -> node2 already works"

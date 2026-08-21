@@ -31,6 +31,9 @@
 #   ./setup_env_cuda.sh <stage>    # run a single stage (re-run one on failure)
 #
 #   stages:  conda  cuda  torch  apex  mpi4py  flashattn  xmoe  verify
+#   extra:   efa      (multi-node interconnect check)
+#            envhook  (rewrite the CUDA_HOME/CPATH conda activation hook in an
+#                      env built before that hook existed)
 #
 #   Optional check, for multi-node runs only:
 #     ./setup_env_cuda.sh efa      # verify NCCL will use EFA, not TCP.
@@ -213,6 +216,57 @@ conda_hook() {
     conda_safe source "$base/etc/profile.d/conda.sh"
 }
 
+# ---------------------------------------------------------------------------
+# write_activation_hook — make CUDA_HOME + CPATH survive `conda activate`.
+#
+# THE BUG THIS FIXES
+#   Megatron JIT-builds its fused kernels through torch.utils.cpp_extension, which
+#   assembles its OWN compiler flag list and adds exactly one CUDA include dir:
+#   "$CUDA_HOME/include". Two things go wrong in a conda CUDA env:
+#     1. No conda hook sets CUDA_HOME. torch falls back to guessing it from
+#        `which nvcc`, landing on $CONDA_PREFIX.
+#     2. The headers are NOT in $CONDA_PREFIX/include — cuda-toolkit puts them in
+#        $CONDA_PREFIX/targets/x86_64-linux/include.
+#   Net result, at the first training step, long after setup "succeeded":
+#        fatal error: cuda_fp16.h: No such file or directory
+#   conda's own ~cuda-nvcc_activate.sh papers over this for setuptools/make builds
+#   by exporting -I flags in CFLAGS/CPPFLAGS — but torch's ninja path ignores those,
+#   which is why `make`-built helpers.cpp compiles and the fused kernels do not.
+#
+# WHY A CONDA HOOK AND NOT A WRAPPER SCRIPT
+#   Writing it here means `conda activate <env>` is sufficient for everyone —
+#   torchrun, srun, bare python, a reviewer reproducing results. Anything that
+#   lives only in a job script or a site env file has to be duplicated per launcher
+#   and silently regresses the moment someone activates the env by hand.
+write_activation_hook() {
+    local act="$ENV_PREFIX/etc/conda/activate.d"
+    local deact="$ENV_PREFIX/etc/conda/deactivate.d"
+    mkdir -p "$act" "$deact"
+    cat > "$act/zzz-elmoe-cuda.sh" <<'HOOK'
+#!/bin/bash
+# Written by setup_env_cuda.sh (ELMoE). See write_activation_hook() there for why.
+# torch.utils.cpp_extension adds only "$CUDA_HOME/include"; conda's CUDA headers
+# live under targets/<arch>/include. Without both vars, JIT fused-kernel builds
+# fail with: fatal error: cuda_fp16.h: No such file or directory
+_elmoe_targets="$CONDA_PREFIX/targets/x86_64-linux"
+export ELMOE_CUDA_HOME_BACKUP="${CUDA_HOME:-}"
+export ELMOE_CPATH_BACKUP="${CPATH:-}"
+export CUDA_HOME="$CONDA_PREFIX"
+[ -d "$_elmoe_targets/include" ] && export CPATH="$_elmoe_targets/include${CPATH:+:$CPATH}"
+unset _elmoe_targets
+HOOK
+    cat > "$deact/zzz-elmoe-cuda.sh" <<'HOOK'
+#!/bin/bash
+# Written by setup_env_cuda.sh (ELMoE). Restores what zzz-elmoe-cuda.sh replaced.
+if [ -n "${ELMOE_CUDA_HOME_BACKUP:-}" ]; then export CUDA_HOME="$ELMOE_CUDA_HOME_BACKUP"; else unset CUDA_HOME; fi
+if [ -n "${ELMOE_CPATH_BACKUP:-}" ];     then export CPATH="$ELMOE_CPATH_BACKUP";         else unset CPATH;     fi
+unset ELMOE_CUDA_HOME_BACKUP ELMOE_CPATH_BACKUP
+HOOK
+    chmod +x "$act/zzz-elmoe-cuda.sh" "$deact/zzz-elmoe-cuda.sh"
+    ok "activation hook written: $act/zzz-elmoe-cuda.sh"
+    info "CUDA_HOME + CPATH now set by \`conda activate $ENV_PREFIX\` alone."
+}
+
 activate_env() {
     conda_hook
     [ -d "$ENV_PREFIX" ] || { echo "ERROR: env '$ENV_PREFIX' not found. Run the 'conda' stage first." >&2; exit 1; }
@@ -221,6 +275,10 @@ activate_env() {
     export CUDA_HOME="$CONDA_PREFIX"
     export PATH="$CUDA_HOME/bin:$PATH"
     export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
+    # Same reason as write_activation_hook(), but for THIS process: the source
+    # builds below (apex, flash-attn) and the verify compile need the headers too.
+    [ -d "$CONDA_PREFIX/targets/x86_64-linux/include" ] && \
+        export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
     info "root:   $ELMOE_ROOT"
     info "python: $(which python)  ($(python --version 2>&1))"
     command -v nvcc >/dev/null 2>&1 && \
@@ -285,6 +343,9 @@ stage_cuda() {
     conda_safe conda install -y -p "$ENV_PREFIX" -c nvidia "cuda-toolkit=$CUDA_VERSION"
     export CUDA_HOME="$ENV_PREFIX"; export PATH="$CUDA_HOME/bin:$PATH"
     nvcc --version | tail -2
+    # Persist CUDA_HOME/CPATH into the env itself, or every later JIT kernel build
+    # depends on whoever launched the job having exported them by hand.
+    write_activation_hook
     ok "nvcc $CUDA_VERSION installed in env."
 }
 
@@ -416,7 +477,24 @@ stage_xmoe() {
     pip install -e .
     cd "$XMOE_ROOT/Megatron-DeepSpeed-X-MoE"
     pip install -e .
-    ok "X-MoE stack installed (editable)."
+
+    # RUNTIME + ANALYSIS deps that nothing else pulls in. Each of these has bitten a
+    # run at the point where it is most expensive to discover:
+    #   six      megatron/tokenizer/bert_tokenization.py imports it unconditionally
+    #            via megatron/__init__.py -> every rank dies at import, and torchrun
+    #            reports it only as an opaque ChildFailedError.
+    #   nltk     tools/preprocess_data.py, during dataset prep.
+    #   pandas   utils/analyze_log.py. Its stdout is redirected into full_run.log, so
+    #   openpyxl a missing dep here loses the ENTIRE throughput/TFLOPs analysis after a
+    #            successful multi-hour run. openpyxl is imported lazily by
+    #            pandas.ExcelWriter, so it does not appear in any import grep.
+    #   matplotlib  utils/plot_loss_curve.py, for loss_validate.
+    #   tensorboard the template always passes --tensorboard-dir; optional (megatron
+    #            guards the import) but you silently lose TB logs without it.
+    #   py-spy   scripts/monitor_run.sh, the per-rank stall monitor. Optional; the
+    #            monitor skips itself with a warning when absent.
+    pip install -q six nltk pandas openpyxl matplotlib tensorboard py-spy
+    ok "X-MoE stack installed (editable) + runtime/analysis deps."
 }
 
 stage_efa() {
@@ -490,6 +568,93 @@ EOF
     printf "${C_HEAD}============================================================${C_OFF}\n"
 }
 
+# ---------------------------------------------------------------------------
+# check_activation_hook — does a PLAIN `conda activate` give a working JIT build?
+#
+# Deliberately runs in a scrubbed sub-shell (env -i, --noprofile --norc). Testing
+# in-process would be worthless: activate_env() exports CUDA_HOME/CPATH itself a
+# few lines earlier, which masks a missing hook and turns this into a check that
+# can never fail. What matters is what a REVIEWER gets from `conda activate` alone.
+#
+# Reproduces exactly what torch.utils.cpp_extension does for a fused kernel: one
+# CUDA include dir, "$CUDA_HOME/include", and nothing from CFLAGS.
+check_activation_hook() {
+    # `|| rc=$?` keeps this in a condition context: under `set -e` a bare non-zero
+    # command would abort the stage before the case below ever ran, turning a
+    # warning into a hard failure.
+    local rc=0
+    env -i HOME="$HOME" PATH="/usr/bin:/bin" CONDA_ROOT="$CONDA_ROOT" ENV_PREFIX="$ENV_PREFIX" \
+        bash --noprofile --norc -c '
+            source "$CONDA_ROOT/etc/profile.d/conda.sh" >/dev/null 2>&1 || exit 3
+            conda activate "$ENV_PREFIX" >/dev/null 2>&1 || exit 3
+            [ -n "${CUDA_HOME:-}" ] || exit 2
+            echo "#include <cuda_fp16.h>" \
+                | "${CXX:-c++}" -x c++ -fsyntax-only -I "$CUDA_HOME/include" - >/dev/null 2>&1 || exit 1
+        ' || rc=$?
+    case $rc in
+        0) ok "activation hook: CUDA_HOME set and cuda_fp16.h resolves — fused kernels will JIT-build" ;;
+        1) warn "cuda_fp16.h NOT reachable from a plain \`conda activate\`."
+           warn "Megatron's fused-kernel JIT build will die with:"
+           warn "    fatal error: cuda_fp16.h: No such file or directory"
+           warn "Fix:  ./setup_env_cuda.sh envhook   (then re-activate the env)" ;;
+        2) warn "CUDA_HOME unset after a plain \`conda activate\` — torch will guess it from nvcc."
+           warn "Fix:  ./setup_env_cuda.sh envhook   (then re-activate the env)" ;;
+        *) warn "could not activate '$ENV_PREFIX' in a clean shell — skipping hook check." ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# print_activation_help — the copy-pasteable "now what?" block.
+#
+# Everything a run needs (CUDA_HOME, CPATH, PATH, LD_LIBRARY_PATH) comes from the
+# activation hook, and both packages are pip -e installs, so PYTHONPATH is not
+# needed. Reviewers reasonably assume otherwise, so say it explicitly rather than
+# letting them guess and export something that shadows the editable installs.
+print_activation_help() {
+    local conda_sh="$CONDA_ROOT/etc/profile.d/conda.sh"
+    printf "\n${C_HEAD}================== how to use this env ==================${C_OFF}\n"
+    cat <<EOF
+
+  Interactive shell — copy/paste:
+
+      source $conda_sh
+      conda activate $ENV_PREFIX
+
+  That is the whole contract. The activation hook exports:
+      CUDA_HOME       = $ENV_PREFIX
+      CPATH           = \$CONDA_PREFIX/targets/x86_64-linux/include
+      PATH            (nvcc, python, py-spy)
+      LD_LIBRARY_PATH (CUDA runtime, aws-ofi-nccl via system ld.so.conf)
+
+  PYTHONPATH: do NOT set it. Both repos are editable (pip -e) installs, so
+  site-packages already resolves them:
+      deepspeed     -> $XMOE_ROOT
+      megatron_core -> $XMOE_ROOT/Megatron-DeepSpeed-X-MoE
+  Exporting PYTHONPATH by hand risks shadowing those with a stale copy.
+
+  Verify (from any directory):
+
+      python -c "import torch, six, deepspeed, megatron; print(torch.cuda.device_count())"
+
+  Batch / multi-node — do NOT rely on your login shell. ssh carries no
+  environment, so put the two lines above in examples_elmoe/scripts/env.sh
+  (copy env.sh.example). Both the driver and every node source that file.
+
+  Re-check the env at any time:
+
+      ./setup_env_cuda.sh verify
+
+EOF
+}
+
+stage_envhook() {
+    CURRENT_STAGE="envhook"; banner "conda activation hook (CUDA_HOME + CPATH)"
+    conda_hook
+    [ -d "$ENV_PREFIX" ] || { echo "ERROR: env '$ENV_PREFIX' not found. Run the 'conda' stage first." >&2; exit 1; }
+    write_activation_hook
+    info "Re-activate to pick it up:  conda deactivate && conda activate $ENV_PREFIX"
+}
+
 stage_verify() {
     CURRENT_STAGE="verify"; banner "verify imports"
     activate_env
@@ -525,7 +690,11 @@ try:
 except Exception as e:
     print(f"  [--] FusedExperts_Triton   NOT importable: {e}")
 PY
+    printf '\n'
+    check_activation_hook
+
     ok "verification complete."
+    print_activation_help
     info "primus_turbo is intentionally absent on NVIDIA — use the Triton backend (use_triton=True)."
     info "For multi-node, also run:  ./setup_env_cuda.sh efa"
 }
@@ -554,6 +723,7 @@ run_all() {
         "stage_$s"
     done
     printf "\n${C_OK}All stages complete.${C_OFF}\n"
+    print_activation_help
     info "Multi-node runs: check the interconnect with  ./setup_env_cuda.sh efa"
 }
 
@@ -568,6 +738,8 @@ case "$STAGE" in
     flashattn|flash-attn)   stage_flashattn ;;
     xmoe|x-moe)             stage_xmoe ;;
     efa|nccl|aws-ofi-nccl)  stage_efa ;;
+    envhook|hook)           stage_envhook ;;
+    activate|howto|use)     conda_hook; print_activation_help ;;
     verify)                 stage_verify ;;
     primus)
         trap - EXIT
@@ -581,6 +753,6 @@ case "$STAGE" in
         trap - EXIT
         echo "ERROR: unknown stage '$STAGE'." >&2
         echo "Valid: conda cuda torch apex mpi4py flashattn xmoe verify   (no arg = all)" >&2
-        echo "Extra: efa (multi-node interconnect check)" >&2
+        echo "Extra: efa (interconnect check)  envhook (rewrite activation hook)  activate (how to use the env)" >&2
         exit 1 ;;
 esac

@@ -11,12 +11,23 @@
 #
 # USAGE
 #   ./setup_2node_aws.sh preflight  <NODE2_IP>   # check before changing anything
+#   ./setup_2node_aws.sh wire       <NODE2_IP>   # preflight+sshkey+nfs+hostfile.
+#                                                # Needs NO conda env -- run this FIRST,
+#                                                # before setup_env_cuda.sh, so the env
+#                                                # you build lands on the shared mount.
 #   ./setup_2node_aws.sh sshkey     <NODE2_IP>   # keygen + self-auth, print pubkey
 #   ./setup_2node_aws.sh nfs        <NODE2_IP>   # export ~/elmoe, mount on node 2
 #   ./setup_2node_aws.sh envfile    <NODE2_IP>   # write scripts/env.sh (auto-detects iface + EFA)
 #   ./setup_2node_aws.sh hostfile   <NODE2_IP>   # write scripts/hostfile
 #   ./setup_2node_aws.sh smoke      <NODE2_IP>   # 16-rank NCCL all-reduce
 #   ./setup_2node_aws.sh all        <NODE2_IP>   # every stage above, in order
+#
+# RECOMMENDED ORDER ON A FRESH PAIR OF INSTANCES
+#   1. security-group rule (console -- see below)
+#   2. ./setup_2node_aws.sh wire <NODE2_IP>      <- no env needed; ~2 min
+#   3. ./setup_env_cuda.sh                       <- ~40 min, lands on the shared mount
+#   4. bash .../examples_elmoe/data/prepare_data_ae.sh
+#   5. ./setup_2node_aws.sh all <NODE2_IP>       <- env.sh + smoke test (rest is idempotent)
 #
 #   NODE2_IP must be the PRIVATE ip. If you only have the public DNS name, resolve
 #   it FROM INSIDE the VPC and you get the private address back:
@@ -75,6 +86,12 @@ stage_preflight() {
     local fail=0
 
     [ -d "$ENV_PREFIX" ] || { warn "conda env missing at $ENV_PREFIX — run ./setup_env_cuda.sh first"; fail=1; }
+    if [ -d "$ENV_PREFIX" ] && [ ! -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
+        warn "env exists but there is no conda at $CONDA_ROOT."
+        warn "  Its base is probably another tree (setup_env_cuda.sh reuses any conda on PATH)."
+        warn "  'envfile' will detect and use the real one; just be aware env.sh will point"
+        warn "  outside \$ELMOE_ROOT, so that path must exist on EVERY node too."
+    fi
     [ -d "$SCRIPTS" ]    || die "scripts dir not found: $SCRIPTS"
 
     local n1g; n1g=$(nvidia-smi -L 2>/dev/null | wc -l)
@@ -196,8 +213,33 @@ stage_nfs() {
         || die "node2 cannot WRITE to the share — check uid match and no_root_squash"
 }
 
+# ---------------------------------------------------------------------------
+# resolve_conda_root — where conda ACTUALLY is, not where we assumed it would be.
+#
+# setup_env_cuda.sh only installs Miniforge when there is no conda anywhere:
+#     if [ ! -d "$CONDA_ROOT" ] && ! command -v conda >/dev/null; then install
+# So if the operator had ANY conda active while building (very likely when the same
+# person sets up a second tree, e.g. ~/elmoe_test then ~/elmoe), the new tree gets an
+# env at $ENV_PREFIX but NO miniforge3 of its own. Writing the assumed path into
+# env.sh then breaks every rank with "no such file or directory", on every node.
+resolve_conda_root() {
+    if [ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
+        echo "$CONDA_ROOT"; return
+    fi
+    local base
+    base="$(conda info --base 2>/dev/null)"
+    if [ -n "$base" ] && [ -f "$base/etc/profile.d/conda.sh" ]; then
+        warn "no conda at $CONDA_ROOT; using the one actually on PATH: $base"
+        warn "  (setup_env_cuda.sh reuses an existing conda instead of installing a"
+        warn "   second copy -- expected when building more than one tree on a box)"
+        echo "$base"; return
+    fi
+    die "no conda found at $CONDA_ROOT and none on PATH. Run ./setup_env_cuda.sh first."
+}
+
 stage_envfile() {
     banner "env.sh"
+    CONDA_ROOT="$(resolve_conda_root)"
     local ifc; ifc=$(detect_iface)
     [ -n "$ifc" ] || die "could not detect a network interface"
     local i2; i2=$(ssh $SSH_OPTS "$NODE2" "ip -br addr | awk '\$2==\"UP\"{print \$1}' | grep -vE '^(lo|docker|veth|br-|virbr)' | head -1" 2>/dev/null)
@@ -288,8 +330,32 @@ EOF
     rm -f "$OUT"; return 1
 }
 
+# ---------------------------------------------------------------------------
+# stage_wire — everything that does NOT need the conda env, so it can run FIRST.
+#
+# Doing this before ./setup_env_cuda.sh is the better order: once ~/elmoe is
+# NFS-exported, the env you build afterwards lands on the shared filesystem
+# automatically and node 2 sees it appear -- no "copy it over" step to forget, and
+# no chance of the two nodes drifting. It also surfaces security-group and ssh
+# problems in the first minute rather than 40 minutes into a build.
+#
+# env.sh generation is deliberately left to 'all', so its verification step runs
+# against a real env instead of warning about a missing one.
+stage_wire() {
+    stage_preflight
+    stage_sshkey || die "install the key on node 2 (instructions above), then re-run 'wire'"
+    stage_nfs
+    stage_hostfile
+    banner "wiring done"
+    info "Node 2 now mounts $ELMOE_ROOT, so everything you install below is shared."
+    info "Next:  ./setup_env_cuda.sh                      (build the env, ~40 min)"
+    info "       cd $XMOE_ROOT/Megatron-DeepSpeed-X-MoE/examples_elmoe/data && bash prepare_data_ae.sh"
+    info "       ./setup_2node_aws.sh all $NODE2          (writes env.sh + NCCL smoke test)"
+}
+
 case "$STAGE" in
     preflight) stage_preflight ;;
+    wire)      stage_wire ;;
     sshkey)    stage_sshkey ;;
     nfs)       stage_nfs ;;
     envfile)   stage_envfile ;;
@@ -305,5 +371,5 @@ case "$STAGE" in
         banner "2-node cluster ready"
         info "Next:  cd $SCRIPTS && bash autorun.sh"
         ;;
-    *) die "unknown stage '$STAGE' (preflight|sshkey|nfs|envfile|hostfile|smoke|all)" ;;
+    *) die "unknown stage '$STAGE' (preflight|wire|sshkey|nfs|envfile|hostfile|smoke|all)" ;;
 esac

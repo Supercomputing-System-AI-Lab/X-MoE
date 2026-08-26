@@ -1,4 +1,4 @@
-# ELMoE on AWS — handover / resume notes
+# X-MoE-4D on AWS — handover / resume notes
 
 Written 2026-08-21. State of the non-SLURM (torchrun) multi-node path after a full
 bring-up on two p4d.24xlarge nodes, and what is left to do.
@@ -9,7 +9,7 @@ bring-up on two p4d.24xlarge nodes, and what is left to do.
 
 | | |
 |---|---|
-| node 1 | `172.31.15.205` (public 3.136.19.132) — NFS **server**, exports `~/elmoe` |
+| node 1 | `172.31.15.205` (public 3.136.19.132) — NFS **server**, exports `~/xmoe-4d` |
 | node 2 | `172.31.10.93` (public 3.149.27.22) — mounts it; **nothing installed locally** |
 | GPUs | 8x A100-SXM4-**40GB** per node, driver 595.91.07 |
 | SG | `sg-0e8795bb2beb47e0b` — All TCP self-referencing rule added |
@@ -26,18 +26,18 @@ Use **private** IPs. Public DNS resolves to the private IP from inside the VPC:
 # 0. (console) SG inbound: All TCP, ports 0-65535, source = that same SG
 ./setup_2node_aws.sh wire <NODE2_IP>     # ssh + NFS + hostfile   (~2 min, no env needed)
 ./setup_env_cuda.sh                       # conda env             (~40 min, lands on the share)
-cd Megatron-DeepSpeed-X-MoE/examples_elmoe/data && bash prepare_data_ae.sh   # (~25 min)
-cd ~/elmoe/X-MoE && ./setup_2node_aws.sh all <NODE2_IP>   # env.sh + NCCL smoke test
+cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data && bash prepare_data_ae.sh   # (~25 min)
+cd ~/xmoe-4d/X-MoE && ./setup_2node_aws.sh all <NODE2_IP>   # env.sh + NCCL smoke test
 ```
 
-`wire` first is deliberate: once `~/elmoe` is exported, everything built afterwards is
+`wire` first is deliberate: once `~/xmoe-4d` is exported, everything built afterwards is
 shared automatically, and SG/ssh problems surface in minute one instead of minute forty.
 
 Activate the env with **two lines and nothing else** — no `CPATH`, no `PYTHONPATH`:
 
 ```bash
-source ~/elmoe/miniforge3/etc/profile.d/conda.sh
-conda activate ~/elmoe/ELMoE_envs/ELMoE-CUDA12.8_repro
+source ~/xmoe-4d/miniforge3/etc/profile.d/conda.sh
+conda activate ~/xmoe-4d/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro
 ```
 
 (`./setup_env_cuda.sh activate` reprints this.)
@@ -51,7 +51,7 @@ conda activate ~/elmoe/ELMoE_envs/ELMoE-CUDA12.8_repro
 | 10B, 1 node, PP2-EP4, mbs1+ckpt | 15/15 steps, 21.0 GB peak |
 | 21B, 2 nodes, PP2-EP8, GBS=1024 | 15/15, 65.2 TFLOPs (75.1 with planner/uneven) |
 | X-MoE / DS-MoE baselines, 2 nodes | 15/15 each |
-| `loss_validate`, 1 node, 100 steps | ELMoE 7.8124 vs X-MoE 7.8058 — curves converge |
+| `loss_validate`, 1 node, 100 steps | X-MoE-4D 7.8124 vs X-MoE 7.8058 — curves converge |
 
 ---
 
@@ -61,8 +61,8 @@ conda activate ~/elmoe/ELMoE_envs/ELMoE-CUDA12.8_repro
    timings. Any `yes-planner` run (including `main_results`) plans against the wrong
    machine. Generate real ones — two sweeps, single node, no EFA needed:
    ```bash
-   bash run_exp_training.sh profiling_cache ELMoE                    # d5120: 21B/25B/50B/63B
-   bash run_exp_training.sh profiling_cache ELMoE --model-size 10B   # d2048: 10B
+   bash run_exp_training.sh profiling_cache X-MoE-4D                    # d5120: 21B/25B/50B/63B
+   bash run_exp_training.sh profiling_cache X-MoE-4D --model-size 10B   # d2048: 10B
    ```
    The key ignores depth, so one sweep serves a whole family.
 2. **`autorun.sh` committed state** still carries an experiment scratchpad with

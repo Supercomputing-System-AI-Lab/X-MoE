@@ -1,20 +1,20 @@
 #!/bin/bash
 ###############################################################################
-# setup_env_rocm.sh — ELMoE reviewer reproduction environment (AMD / Frontier)
+# setup_env_rocm.sh — X-MoE-4D reviewer reproduction environment (AMD / Frontier)
 #
-# Builds the full ELMoE software stack on Frontier (ROCm 6.4.1, gfx90a).
+# Builds the full X-MoE-4D software stack on Frontier (ROCm 6.4.1, gfx90a).
 # AMD counterpart of setup_env_cuda.sh — same layout, same one knob, same stages.
 #
 # ---------------------------------------------------------------------------
-# WHERE THINGS GO — one knob: ELMOE_ROOT
+# WHERE THINGS GO — one knob: XMOE4D_ROOT
 #
-#   ELMOE_ROOT=/lustre/orion/<proj>/proj-shared/$USER/elmoe ./setup_env_rocm.sh
+#   XMOE4D_ROOT=/lustre/orion/<proj>/proj-shared/$USER/xmoe-4d ./setup_env_rocm.sh
 #
 # That single variable relocates EVERYTHING this script writes:
 #
-#   $ELMOE_ROOT/ELMoE_envs/ELMoE-ROCM6.4.1_repro   conda environment (~20 GB)
-#   $ELMOE_ROOT/ELMoE_deps/                        apex + flash-attn (+ aws-ofi-rccl)
-#   $ELMOE_ROOT/ELMoE_cache/                       pip + conda caches (these get big)
+#   $XMOE4D_ROOT/XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro   conda environment (~20 GB)
+#   $XMOE4D_ROOT/XMoE4D_deps/                           apex + flash-attn (+ aws-ofi-rccl)
+#   $XMOE4D_ROOT/XMoE4D_cache/                          pip + conda caches (these get big)
 #
 # Defaults to one level ABOVE the X-MoE checkout, so a repo at <dir>/X-MoE puts
 # them alongside it as siblings — nothing large is ever written inside the repo.
@@ -25,7 +25,7 @@
 #     (thousands of ranks importing Python hammer its metadata server).
 #   * /lustre/orion/<proj>/scratch IS PURGED (files untouched for a while are
 #     deleted). Use proj-shared or world-shared, which are not purged:
-#         /lustre/orion/<proj>/proj-shared/$USER/elmoe
+#         /lustre/orion/<proj>/proj-shared/$USER/xmoe-4d
 #   The script checks free space (and your quota) UP FRONT and refuses to start
 #   if there is not room, rather than dying 20 GB into the torch install.
 #
@@ -38,24 +38,24 @@
 #
 #   Two stages are NOT part of the default run (Frontier-/calibration-specific).
 #   Run them explicitly, only if you need them:
-#     ./setup_env_rocm.sh aws-ofi-rccl   # Slingshot RCCL plugin -> ELMoE_deps/.
+#     ./setup_env_rocm.sh aws-ofi-rccl   # Slingshot RCCL plugin -> XMoE4D_deps/.
 #                                        # Frontier-only; skip on non-Frontier systems.
 #                                        # Prints the exports you must set afterward.
 #                                        # (NVIDIA equivalent: the DLAMI preinstalls
 #                                        #  aws-ofi-nccl — see setup_env_cuda.sh efa)
 #     ./setup_env_rocm.sh primus         # calibrated primus_turbo backend.
 #                                        # AMD-only (Composable Kernel); on NVIDIA use
-#                                        # ELMoE's Triton grouped-GEMM instead.
+#                                        # X-MoE-4D's Triton grouped-GEMM instead.
 #
 # PREREQUISITE (do this once, by hand — it is how you got this script):
 #   module reset
 #   module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 \
 #               craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja/1.12.1.lua
 #   cd /lustre/orion/<proj>/proj-shared/$USER            # NOT ~ — see above
-#   git clone -b ELMoE --single-branch https://github.com/Supercomputing-System-AI-Lab/X-MoE.git
+#   git clone -b X-MoE-4D --single-branch https://github.com/Supercomputing-System-AI-Lab/X-MoE.git
 #   cd X-MoE && ./setup_env_rocm.sh
 #
-# OVERRIDES: ELMOE_ROOT, ENV_PREFIX, DEPS_DIR, CACHE_DIR, MAX_JOBS, APEX_GIT_REF,
+# OVERRIDES: XMOE4D_ROOT, ENV_PREFIX, DEPS_DIR, CACHE_DIR, MAX_JOBS, APEX_GIT_REF,
 #            LIBFABRIC_PATH, GCC_NATIVE_BIN, RUNTIME_ENV_FILE, MIN_FREE_GB
 ###############################################################################
 
@@ -69,17 +69,17 @@ XMOE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # <dir>/X-MoE puts env, deps and caches alongside it as siblings:
 #
 #   <dir>/X-MoE/          <- the repo (this script lives here)
-#   <dir>/ELMoE_envs/     <- conda environment
-#   <dir>/ELMoE_deps/     <- apex + flash-attn (+ aws-ofi-rccl) sources
-#   <dir>/ELMoE_cache/    <- pip + conda caches
+#   <dir>/XMoE4D_envs/     <- conda environment
+#   <dir>/XMoE4D_deps/     <- apex + flash-attn (+ aws-ofi-rccl) sources
+#   <dir>/XMoE4D_cache/    <- pip + conda caches
 #
 # Identical layout to setup_env_cuda.sh. Override to relocate everything at once.
-ELMOE_ROOT="${ELMOE_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"
+XMOE4D_ROOT="${XMOE4D_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"
 
-# Each derives from ELMOE_ROOT but stays independently overridable.
-ENV_PREFIX="${ENV_PREFIX:-$ELMOE_ROOT/ELMoE_envs/ELMoE-ROCM6.4.1_repro}"
-DEPS_DIR="${DEPS_DIR:-$ELMOE_ROOT/ELMoE_deps}"
-CACHE_DIR="${CACHE_DIR:-$ELMOE_ROOT/ELMoE_cache}"
+# Each derives from XMOE4D_ROOT but stays independently overridable.
+ENV_PREFIX="${ENV_PREFIX:-$XMOE4D_ROOT/XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro}"
+DEPS_DIR="${DEPS_DIR:-$XMOE4D_ROOT/XMoE4D_deps}"
+CACHE_DIR="${CACHE_DIR:-$XMOE4D_ROOT/XMoE4D_cache}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 
 # Keep the fat caches off $HOME. This is NOT cosmetic on OLCF: pip caches the
@@ -91,7 +91,7 @@ export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$CACHE_DIR/pip}"
 export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_DIR/conda}"
 export TMPDIR="${TMPDIR:-$CACHE_DIR/tmp}"
 
-# Free space required under ELMOE_ROOT, checked BEFORE any stage runs. Measured:
+# Free space required under XMOE4D_ROOT, checked BEFORE any stage runs. Measured:
 # conda env ~20 GB + caches ~4 GB, peaking higher during the apex/flash-attn build.
 MIN_FREE_GB="${MIN_FREE_GB:-25}"
 
@@ -110,7 +110,7 @@ LIBFABRIC_PATH="${LIBFABRIC_PATH:-/opt/cray/libfabric/1.22.0}"
 # match the Stage-2 toolchain.
 GCC_NATIVE_BIN="${GCC_NATIVE_BIN:-/opt/cray/pe/gcc-native/13/bin}"
 # Runtime env file the rccl stage writes (source it inside your SLURM job).
-RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$DEPS_DIR/elmoe_runtime_env.sh}"
+RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$DEPS_DIR/xmoe_4d_runtime_env.sh}"
 
 # Exact Frontier module stack (kept identical to the manual prerequisite).
 MODULE_STACK="cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja/1.12.1.lua"
@@ -181,26 +181,26 @@ free_gib() {
 }
 
 check_space() {
-    local avail; avail="$(free_gib "$ELMOE_ROOT")"
-    info "free space at ELMOE_ROOT=${ELMOE_ROOT}: ${avail:-?} GB (need >= ${MIN_FREE_GB} GB)"
+    local avail; avail="$(free_gib "$XMOE4D_ROOT")"
+    info "free space at XMOE4D_ROOT=${XMOE4D_ROOT}: ${avail:-?} GB (need >= ${MIN_FREE_GB} GB)"
 
-    case "$ELMOE_ROOT" in
+    case "$XMOE4D_ROOT" in
         "$HOME"/*|"$HOME"|/ccs/home/*)
-            warn "ELMOE_ROOT is under your NFS home. It is small (50 GB quota on OLCF) and"
+            warn "XMOE4D_ROOT is under your NFS home. It is small (50 GB quota on OLCF) and"
             warn "is the wrong filesystem for a conda env — thousands of ranks importing"
             warn "Python hammer its metadata server. Use a parallel filesystem." ;;
     esac
 
     if [ -n "$avail" ] && [ "$avail" -lt "$MIN_FREE_GB" ]; then
         printf "\n${C_ERR}[FAILED]${C_OFF} only %s GB free (or left in quota) on the filesystem holding\n" "$avail" >&2
-        printf "         ELMOE_ROOT=%s  (need >= %s GB).\n" "$ELMOE_ROOT" "$MIN_FREE_GB" >&2
+        printf "         XMOE4D_ROOT=%s  (need >= %s GB).\n" "$XMOE4D_ROOT" "$MIN_FREE_GB" >&2
         cat >&2 <<EOF
 
          The full stack needs ~25 GB (a ~20 GB conda env plus pip/conda caches).
-         Point ELMOE_ROOT at a bigger filesystem. On OLCF use a NON-PURGED
+         Point XMOE4D_ROOT at a bigger filesystem. On OLCF use a NON-PURGED
          Lustre area (scratch IS purged; /ccs/home is quota-limited):
 
-             ELMOE_ROOT=/lustre/orion/<proj>/proj-shared/\$USER/elmoe ./setup_env_rocm.sh
+             XMOE4D_ROOT=/lustre/orion/<proj>/proj-shared/\$USER/xmoe-4d ./setup_env_rocm.sh
 
          Aborting before any build. Nothing was installed.
 EOF
@@ -247,7 +247,7 @@ activate_env() {
 stage_conda() {
     CURRENT_STAGE="conda"; banner "conda env ($ENV_PREFIX, python $PYTHON_VERSION)"
     check_space
-    mkdir -p "$ELMOE_ROOT" "$DEPS_DIR" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$TMPDIR"
+    mkdir -p "$XMOE4D_ROOT" "$DEPS_DIR" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$TMPDIR"
     load_modules
     conda_hook
     if [ -d "$ENV_PREFIX" ]; then
@@ -332,7 +332,7 @@ write_runtime_env() {
     # $PYTHONPATH) stay literal so they append at source time.
     local plugin_lib="$DEPS_DIR/aws-ofi-rccl/lib"
     cat > "$RUNTIME_ENV_FILE" <<EOF
-# ELMoE runtime environment — SOURCE THIS in your SLURM job before srun.
+# X-MoE-4D runtime environment — SOURCE THIS in your SLURM job before srun.
 # Generated by setup_env_rocm.sh (rccl stage); paths resolved at build time.
 export NCCL_NET_PLUGIN="$plugin_lib/librccl-net.so"
 export LD_LIBRARY_PATH="$plugin_lib:\$LD_LIBRARY_PATH"
@@ -439,7 +439,7 @@ run_all() {
     # Echo every resolved path and pin, so a reviewer sees exactly what their
     # overrides produced before a long build starts.
     info "repo:       $XMOE_ROOT"
-    info "ELMOE_ROOT: $ELMOE_ROOT"
+    info "XMOE4D_ROOT: $XMOE4D_ROOT"
     info "env:        $ENV_PREFIX"
     info "deps:       $DEPS_DIR"
     info "cache:      $CACHE_DIR"

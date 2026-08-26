@@ -1,6 +1,6 @@
-# ELMoE multi-node on AWS EC2 (torchrun / non-SLURM)
+# X-MoE-4D multi-node on AWS EC2 (torchrun / non-SLURM)
 
-Step-by-step for bringing up `examples_elmoe/scripts/autorun.sh` across two or more
+Step-by-step for bringing up `examples_xmoe_4d/scripts/autorun.sh` across two or more
 EC2 GPU instances, with no scheduler. The SLURM path
 (`scripts-frontier/autorun_frontier.sh`) is unaffected by anything here.
 
@@ -11,8 +11,8 @@ EC2 GPU instances, with no scheduler. The SLURM path
 | Instance type | `p4d.24xlarge` (8x A100-SXM4-40GB per node) |
 | AMI | AWS Deep Learning AMI (Amazon Linux 2023) |
 | Node count | 2 (16 GPUs total) |
-| Conda env | `~/elmoe/ELMoE_envs/ELMoE-CUDA12.8_repro` (torch 2.9.1+cu128, deepspeed 0.15.5) |
-| Repo root | `~/elmoe/X-MoE` |
+| Conda env | `~/xmoe-4d/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro` (torch 2.9.1+cu128, deepspeed 0.15.5) |
+| Repo root | `~/xmoe-4d/X-MoE` |
 | Interconnect | ENA/TCP -- **EFA not attached**, see [Appendix A](#appendix-a-efa) |
 
 Substitute your own values as you go. Two placeholders appear throughout:
@@ -27,11 +27,11 @@ Substitute your own values as you go. Two placeholders appear throughout:
 Worth understanding before you debug anything, because it explains every
 prerequisite below.
 
-`autorun.sh` fills placeholders in `elmoe.sh.template` and runs the result. When
-`NODES > 1`, that rendered script (`elmoe.sh.template:505-540`):
+`autorun.sh` fills placeholders in `xmoe_4d.sh.template` and runs the result. When
+`NODES > 1`, that rendered script (`xmoe_4d.sh.template:505-540`):
 
 1. Generates two helper scripts inside the job directory:
-   - `logs/job_<id>/rank_cmd.sh` -- the per-rank command (`python ELMoE_launch.py ...`)
+   - `logs/job_<id>/rank_cmd.sh` -- the per-rank command (`python ELM_PP_launch.py ...`)
    - `logs/job_<id>/node_launch.sh` -- the per-node command (`source env.sh; torchrun ...`)
 2. Reads `./hostfile`; **host on line 1 becomes `MASTER_ADDR`**.
 3. `ssh -o BatchMode=yes <host> "bash '<abs-path>/node_launch.sh'"` for **every**
@@ -62,8 +62,8 @@ The env built by `setup_env_cuda.sh` is missing a package Megatron imports
 unconditionally:
 
 ```bash
-source ~/elmoe/miniforge3/etc/profile.d/conda.sh
-conda activate ~/elmoe/ELMoE_envs/ELMoE-CUDA12.8_repro
+source ~/xmoe-4d/miniforge3/etc/profile.d/conda.sh
+conda activate ~/xmoe-4d/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro
 pip install six nltk tensorboard py-spy
 ```
 
@@ -89,7 +89,7 @@ traceback. Get in the habit of reading it first.
 
 ### A2. Build the dataset
 
-`elmoe.sh.template:119-121` expects three files that the repo does not ship:
+`xmoe_4d.sh.template:119-121` expects three files that the repo does not ship:
 
 ```bash
 export VOCAB_FILE=../data/gpt2-vocab.json
@@ -100,7 +100,7 @@ export DATA_PATH=../data/my-gpt2_text_document
 Generate them (~20-30 min; downloads a 1 GB corpus, needs ~10 GB free):
 
 ```bash
-cd ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data
+cd ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data
 bash prepare_data_ae.sh
 ```
 
@@ -115,18 +115,18 @@ copy -- or, better, builds it once on the shared filesystem from Phase B.
 
 ### A3. Create `env.sh`
 
-Sourced on every node before `torchrun` starts (`elmoe.sh.template:58, 517-518`).
+Sourced on every node before `torchrun` starts (`xmoe_4d.sh.template:58, 517-518`).
 Copy `env.sh.example` or write it directly:
 
 ```bash
-cd ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts
+cd ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
 cat > env.sh <<'EOF'
 #!/bin/bash
 # --- 1. Python environment ---
 # Guard against `set -u` + the conda cuda-nvcc activate.d script.
 export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:-}"
-source /home/ec2-user/elmoe/miniforge3/etc/profile.d/conda.sh
-conda activate /home/ec2-user/elmoe/ELMoE_envs/ELMoE-CUDA12.8_repro
+source /home/ec2-user/xmoe-4d/miniforge3/etc/profile.d/conda.sh
+conda activate /home/ec2-user/xmoe-4d/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro
 
 # CUDA_HOME and CPATH are NOT set here on purpose -- setup_env_cuda.sh installs a conda
 # activation hook that provides both. See "CUDA headers" below if you hit cuda_fp16.h errors.
@@ -144,7 +144,7 @@ If the run dies compiling fused kernels, your env predates the activation hook. 
 
 ```bash
 ./setup_env_cuda.sh envhook
-conda deactivate && conda activate ~/elmoe/ELMoE_envs/ELMoE-CUDA12.8_repro
+conda deactivate && conda activate ~/xmoe-4d/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro
 ./setup_env_cuda.sh verify      # look for the "activation hook:" line
 ```
 
@@ -156,7 +156,7 @@ for `make`/setuptools builds by exporting `-I` flags in `CFLAGS`/`CPPFLAGS` -- w
 `megatron/data/helpers.cpp` compiles fine moments before the fused kernels fail.
 
 `write_activation_hook()` in `setup_env_cuda.sh` writes
-`$CONDA_PREFIX/etc/conda/activate.d/zzz-elmoe-cuda.sh`, exporting `CUDA_HOME` and `CPATH`
+`$CONDA_PREFIX/etc/conda/activate.d/zzz-xmoe-4d-cuda.sh`, exporting `CUDA_HOME` and `CPATH`
 (honoured by both gcc and nvcc), with a matching `deactivate.d` script that restores them.
 Because it lives in the env, `conda activate` alone is sufficient -- no wrapper script, and
 nothing to duplicate per launcher. `stage_cuda` writes it on every fresh build; `envhook`
@@ -172,7 +172,7 @@ exactly what `node_launch.sh` does (`source env.sh`, then run):
 
 ```bash
 env -i HOME=$HOME PATH=/usr/bin:/bin bash --noprofile --norc -c '
-  cd ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts
+  cd ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
   source ./env.sh
   echo "CUDA_HOME=$CUDA_HOME"
   echo "CPATH=$CPATH"
@@ -191,11 +191,11 @@ only ever makes sense `source`d, which is how the launcher uses it.
 
 ```bash
 PP_STRATEGY_MAP["1:8"]="2:4"                                             # PP2, EP4
-PP_BATCH_MAP["1:8"]=" 4:20:15:ELMOE-3D:10B:no-ckpt:0:even:no-planner "   # mbs 4, 20 micro-batches, 15 iters
+PP_BATCH_MAP["1:8"]=" 4:20:15:X-MOE-4D:10B:no-ckpt:0:even:no-planner "   # mbs 4, 20 micro-batches, 15 iters
 ```
 
 ```bash
-cd ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts
+cd ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
 bash autorun.sh 2>&1 | tee /tmp/1node.log
 ```
 
@@ -264,44 +264,44 @@ the *same absolute path*.
 
 #### Option 1: NFS export from node 1 (fastest to set up)
 
-Exporting `~/elmoe` covers the repo, the conda env, the deps and the dataset at once.
+Exporting `~/xmoe-4d` covers the repo, the conda env, the deps and the dataset at once.
 
 ```bash
 # --- on node 1 ---
-sudo bash -c 'echo "/home/ec2-user/elmoe <NODE2_IP>(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports'
+sudo bash -c 'echo "/home/ec2-user/xmoe-4d <NODE2_IP>(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports'
 sudo systemctl enable --now nfs-server
 sudo exportfs -ra
 sudo exportfs -v          # confirm the export is listed
 
 # --- on node 2 ---
 sudo dnf install -y nfs-utils
-sudo mkdir -p /home/ec2-user/elmoe
-sudo mount -t nfs <NODE1_IP>:/home/ec2-user/elmoe /home/ec2-user/elmoe
+sudo mkdir -p /home/ec2-user/xmoe-4d
+sudo mount -t nfs <NODE1_IP>:/home/ec2-user/xmoe-4d /home/ec2-user/xmoe-4d
 ```
 
 Persist across reboots by appending to node 2's `/etc/fstab`:
 
 ```
-<NODE1_IP>:/home/ec2-user/elmoe  /home/ec2-user/elmoe  nfs  defaults,_netdev  0 0
+<NODE1_IP>:/home/ec2-user/xmoe-4d  /home/ec2-user/xmoe-4d  nfs  defaults,_netdev  0 0
 ```
 
-Exporting the whole of `~/elmoe` is what makes the rest of Phase B trivial. In one
+Exporting the whole of `~/xmoe-4d` is what makes the rest of Phase B trivial. In one
 mount node 2 inherits, at byte-identical paths:
 
 | | |
 |---|---|
-| `miniforge3/` + `ELMoE_envs/` | the conda env, **including the CUDA activation hook** (`CUDA_HOME` / `CPATH`) |
+| `miniforge3/` + `XMoE4D_envs/` | the conda env, **including the CUDA activation hook** (`CUDA_HOME` / `CPATH`) |
 | the env's `bin/` | `python`, `nvcc`, and `py-spy` (which the monitor needs on *every* node) |
 | `X-MoE/` | repo, both editable installs, and the JIT-cached fused kernels |
 | `.../scripts/env.sh` | the file the driver and every node source |
-| `.../examples_elmoe/data/` | the tokenized dataset |
+| `.../examples_xmoe_4d/data/` | the tokenized dataset |
 | `.../scripts/logs/` | the shared `JOB_DIR` all 16 ranks write into |
 
 So there is no "install everything twice" step, and no risk of the two nodes
 drifting.
 
 Trade-off: every Python import on node 2 crosses NFS, so rank startup is slower.
-Correctness is unaffected. If node 2 has its own `~/elmoe` install, this mount
+Correctness is unaffected. If node 2 has its own `~/xmoe-4d` install, this mount
 shadows it -- which is what you want: identical paths, one shared job directory.
 
 #### Option 2: FSx for Lustre (production)
@@ -314,7 +314,7 @@ throughput and it scales past two nodes, but it is a separate provisioning step.
 
 ```bash
 ssh -o BatchMode=yes <NODE2_IP> '
-  source ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts/env.sh
+  source ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts/env.sh
   echo "CUDA_HOME=$CUDA_HOME"
   echo "CPATH=$CPATH"
   echo "iface=$(ip -br addr | awk "\$2==\"UP\"{print \$1}" | head -1)"
@@ -334,12 +334,12 @@ One host per line, **line 1 becomes `MASTER_ADDR`**. Use IPs rather than
 hostnames to avoid DNS resolution differences between nodes.
 
 ```bash
-cd ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts
+cd ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
 printf '<NODE1_IP>\n<NODE2_IP>\n' > hostfile
 ```
 
 The line count must equal the node count in the `autorun.sh` map key, or the
-launcher aborts (`elmoe.sh.template:373-376`).
+launcher aborts (`xmoe_4d.sh.template:373-376`).
 
 ### B5. NCCL smoke test
 
@@ -348,7 +348,7 @@ same torchrun invocation the real run uses, and fails in seconds rather than 20
 minutes into training.
 
 ```bash
-cat > ~/elmoe/ar_smoke.py <<'EOF'
+cat > ~/xmoe-4d/ar_smoke.py <<'EOF'
 import os, torch, torch.distributed as dist
 
 local_rank = int(os.environ["LOCAL_RANK"])
@@ -365,9 +365,9 @@ EOF
 ```
 
 ```bash
-cat > ~/elmoe/smoke2node.sh <<'EOF'
+cat > ~/xmoe-4d/smoke2node.sh <<'EOF'
 #!/bin/bash
-SCRIPTS=$HOME/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts
+SCRIPTS=$HOME/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
 MASTER=<NODE1_IP>
 HOSTS=(<NODE1_IP> <NODE2_IP>)
 NPROC=8
@@ -377,7 +377,7 @@ for h in "${HOSTS[@]}"; do
   ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$h" \
     "source $SCRIPTS/env.sh && torchrun --nnodes ${#HOSTS[@]} --nproc_per_node $NPROC \
      --rdzv_backend c10d --rdzv_endpoint ${MASTER}:29500 --rdzv_id smoke \
-     $HOME/elmoe/ar_smoke.py" 2>&1 | sed "s/^/[$h] /" >> "$OUT" &
+     $HOME/xmoe-4d/ar_smoke.py" 2>&1 | sed "s/^/[$h] /" >> "$OUT" &
 done
 wait
 [ "$1" = "-v" ] && cat "$OUT"
@@ -399,8 +399,8 @@ fi
 echo "FAIL: expected world=$EXPECT sum=$EXPECT, got world=$W sum=$S"
 rm -f "$OUT"; exit 1
 EOF
-chmod +x ~/elmoe/smoke2node.sh
-bash ~/elmoe/smoke2node.sh
+chmod +x ~/xmoe-4d/smoke2node.sh
+bash ~/xmoe-4d/smoke2node.sh
 ```
 
 Expected:
@@ -413,12 +413,12 @@ PASS: world=16, all-reduce sum=16.0 (== world, so every rank contributed)
 sums to N only if every rank actually took part. A `world=16` that summed to 8 would
 mean half the ranks silently no-oped.
 
-Both files live under `~/elmoe` deliberately -- they must exist on every node, which
+Both files live under `~/xmoe-4d` deliberately -- they must exist on every node, which
 the shared mount guarantees.
 
 #### The traceback you will see, and why it is not a failure
 
-With `--rdzv_backend c10d` (which `elmoe.sh.template` also uses), whichever agent
+With `--rdzv_backend c10d` (which `xmoe_4d.sh.template` also uses), whichever agent
 hosts the rendezvous store exits first and tears it down. Any agent still doing its
 shutdown bookkeeping then logs a ~40-line stack ending in:
 
@@ -448,11 +448,11 @@ Comment out the single-node pair and add a two-node one:
 ```bash
 # ---- single node (8 GPUs): PP2-EP4 ----
 # PP_STRATEGY_MAP["1:8"]="2:4"
-# PP_BATCH_MAP["1:8"]=" 1:2:15:ELMOE-3D:10B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["1:8"]=" 1:2:15:X-MOE-4D:10B:ckpt:1:even:no-planner "
 
 # ---- 2 nodes (16 GPUs): PP2-EP8 ----
 PP_STRATEGY_MAP["2:16"]="2:8"
-PP_BATCH_MAP["2:16"]=" 1:2:15:ELMOE-3D:10B:ckpt:1:even:no-planner "
+PP_BATCH_MAP["2:16"]=" 1:2:15:X-MOE-4D:10B:ckpt:1:even:no-planner "
 ```
 
 Key format is `NODES:TOTAL_GPUS`; the strategy value is `PP_SIZE:EP_PARALLEL_SIZE`.
@@ -474,7 +474,7 @@ build one later, use `PROFILE_MAP` (it sweeps micro-batch sizes 1-8).
 ### C2. Launch
 
 ```bash
-cd ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts
+cd ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
 bash autorun.sh 2>&1 | tee /tmp/2node.log
 ```
 
@@ -501,7 +501,7 @@ rendezvous quietly timed out into a single-node world.
 ## Monitoring a run (py-spy)
 
 `scripts/monitor_run.sh` is the torchrun port of `scripts-frontier/monitor_run.sh`. It is
-wired into `elmoe.sh.template` and starts automatically, backgrounded, alongside training.
+wired into `xmoe_4d.sh.template` and starts automatically, backgrounded, alongside training.
 Same CLI and same output contract as the Frontier version, so anything you know about
 reading those files transfers directly.
 
@@ -552,7 +552,7 @@ tail -f logs/job_<id>/a-monitor.txt
   runs directly. Multi-node reuses the Phase B keys.
 
 ```bash
-ELMOE_MONITOR=0 bash autorun.sh                 # disable entirely
+XMOE4D_MONITOR=0 bash autorun.sh                 # disable entirely
 MON_FAST=30 MON_SLOW=120 bash autorun.sh        # 30s for the first MON_WINDOW s, then 120s
 MON_TRACE_FRAMES=30 bash autorun.sh             # deeper stacks
 ```
@@ -579,7 +579,7 @@ Defaults: `MON_FAST=60`, `MON_SLOW=180`, `MON_WINDOW=300`, `MON_TRACE_FRAMES=20`
 | `torch.OutOfMemoryError` in `moe/experts.py` `torch.cat` | 40 GB A100 vs configs tuned for 64 GB MI250X; `MBS` too high and/or `no-ckpt` | [Appendix C](#appendix-c-memory-tuning-on-40-gb-a100s) |
 | Only 8 rank logs for a 2-node run | Node 2 never joined | Re-run B5 |
 | Every rank reports rank 0 | `SLURM_PROCID` exported in `env.sh` | Remove it; `pretrain_gpt_deepspeed.py` reads it before `RANK` |
-| Multi-node run behaves differently from single-node (earlier OOM, no `NCCL INFO`) | `ssh` carries no environment, so driver globals never reached remote nodes | Fixed: `elmoe.sh.template` now emits `ELMOE_PROPAGATE_VARS` into `node_launch.sh` |
+| Multi-node run behaves differently from single-node (earlier OOM, no `NCCL INFO`) | `ssh` carries no environment, so driver globals never reached remote nodes | Fixed: `xmoe_4d.sh.template` now emits `XMOE4D_PROPAGATE_VARS` into `node_launch.sh` |
 | `RuntimeError: NCCL Error 1: unhandled cuda error` in `all_to_all_single` | Usually a masked CUDA OOM -- NCCL cannot allocate its buffers | Check `HBM%` in `a-monitor.txt`; if it is 85%+, it is memory. See [Appendix C](#appendix-c-memory-tuning-on-40-gb-a100s) |
 
 ---
@@ -627,7 +627,7 @@ BS : NBS : TRAIN_ITERS : MOE_TYPE : MODEL_SIZE : CHECKPOINT : CKPT_LAYERS : PP_P
 A safe first green run on 40 GB:
 
 ```bash
-PP_BATCH_MAP["1:8"]=" 1:2:15:ELMOE-3D:10B:ckpt:1:even:no-planner "
+PP_BATCH_MAP["1:8"]=" 1:2:15:X-MOE-4D:10B:ckpt:1:even:no-planner "
 ```
 
 Once green, raise `BS` until it OOMs again, then back off one step. Dropping back to
@@ -660,7 +660,7 @@ The registry ships reduced-layer variants for exactly this -- `10B_1L`, `10B_2L`
 but cut the layer count, which is enough to validate plumbing:
 
 ```bash
-PP_BATCH_MAP["1:8"]=" 1:2:15:ELMOE-3D:10B_4L:ckpt:1:even:no-planner "
+PP_BATCH_MAP["1:8"]=" 1:2:15:X-MOE-4D:10B_4L:ckpt:1:even:no-planner "
 ```
 
 ### Catching the OOM in the monitor
@@ -728,7 +728,7 @@ come from an EFA-enabled cluster.
 | `scripts/env.sh` | **No** -- site-specific; `env.sh.example` is the template |
 | `scripts/hostfile` | **No** -- site-specific; `hostfile.example` is the template |
 | `scripts/logs/` | No -- already in `.gitignore` |
-| `examples_elmoe/data/*.{bin,idx,json,txt,jsonl}` | No -- already in `.gitignore` |
+| `examples_xmoe_4d/data/*.{bin,idx,json,txt,jsonl}` | No -- already in `.gitignore` |
 | `scripts/monitor_run.sh` | **Yes** -- part of the repo, like its Frontier counterpart |
 | `scripts/temp_sh/` | No -- generated |
 | `scripts/output/` | No -- generated |
@@ -737,6 +737,6 @@ come from an EFA-enabled cluster.
 committing so nobody pushes their private IPs:
 
 ```bash
-cd ~/elmoe/X-MoE/Megatron-DeepSpeed-X-MoE
-printf 'examples_elmoe/scripts/env.sh\nexamples_elmoe/scripts/hostfile\nexamples_elmoe/scripts/temp_sh/\nexamples_elmoe/scripts/output/\n' >> .gitignore
+cd ~/xmoe-4d/X-MoE/Megatron-DeepSpeed-X-MoE
+printf 'examples_xmoe_4d/scripts/env.sh\nexamples_xmoe_4d/scripts/hostfile\nexamples_xmoe_4d/scripts/temp_sh/\nexamples_xmoe_4d/scripts/output/\n' >> .gitignore
 ```

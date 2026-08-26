@@ -146,7 +146,7 @@ class FusedExperts_Primus(nn.Module):
         output = turbo.ops.grouped_gemm(hidden, self.down_proj_weight, m_size, trans_b=False)
         return output
 
-from .elmoe_triton_groupgemm import Kernel4v2_GEMM, build_index_tensors
+from .triton_groupgemm import Kernel4v2_GEMM, build_index_tensors
 
 class FusedExperts_Triton(nn.Module):
     def __init__(self, expert: nn.Module, config, num_local_experts: int = 1, expert_group_name: Optional[str] = None, is_uneven_tokens = False) -> None:

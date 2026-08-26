@@ -135,14 +135,14 @@ class PipelineModule(nn.Module):
                  activation_checkpoint_func=checkpointing.checkpoint,
                  checkpointable_layers=None,
                  dynamic_shape=False,
-                 # ELMoE: explicit partition control
+                 # X-MoE-4D: explicit partition control
                  custom_pipeline_partition=None,           # list[int] e.g. [6, 8, 8, 10]
                  custom_checkpoint_partition=None,       # list[int] e.g. [6, 0, 0, 0]
                  ):
 
         super().__init__()
         
-        # Init ELMoE PP ckpt partitions 
+        # Init X-MoE-4D PP ckpt partitions 
         self.custom_pipeline_partition = custom_pipeline_partition
         self.custom_checkpoint_partition = custom_checkpoint_partition 
         

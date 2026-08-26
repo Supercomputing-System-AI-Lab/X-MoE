@@ -109,7 +109,7 @@ Before launching your own training, you need to prepare the data to **Megatron's
 
 If you just want to **test the X-MoE training**, we also provide a script to prepare the sample dataset:
 ```bash
-cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/data
+cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data
 ./prepare_data_ae.sh
 ```
 
@@ -118,27 +118,31 @@ cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/data
 We provide training examples with **two launching methods**: `torchrun` and `srun`. Below is the structure of the example scripts we provided:
 
 ```bash
-examples_xmoe/
+examples_xmoe_4d/
 ├── scripts/           # scripts using torchrun to launch; tested with NVIDIA A100 node
-│   ├── X-MoE-Small-node-1.sh
-│   └── ...
+│   ├── run_exp_training.sh          # one-command launcher (env_validate / training / ...)
+│   ├── autorun.sh                   # map-driven multi-config launcher
+│   └── xmoe_4d.sh.template          # per-run driver rendered by the two above
 └── scripts-frontier/  # scripts using srun to launch; tested on Frontier (MI250X)
-    ├── n8-Small-XMoE.slurm
-    └── ...
+    ├── run_exp_training.sh          # one-command launcher
+    ├── autorun_frontier.sh          # map-driven multi-config launcher
+    └── frontier_xmoe_4d.slurm.template
 ```
 
-**Quick Start Recommendation**: Use `X-MoE-Small-node-1.sh` or `n8-Small-XMoE.slurm` to launch a **10B DeepSeek-MoE-like model** training task on one GPU node with multiple GPUs.
+**Quick Start Recommendation**: Use `./run_exp_training.sh env_validate` to launch a **10B DeepSeek-MoE-like model** training task on one GPU node with multiple GPUs. See
+[`examples_xmoe_4d/README.md`](Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/README.md) for the full
+set of modes and for reproducing the paper's results.
 
 #### Option 1: Using torchrun (NVIDIA)
 ```bash
-cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts
-./X-MoE-Small-node-1.sh <NUM_GPUS> <MICRO_BATCH_SIZE>
+cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
+./run_exp_training.sh env_validate
 ```
 
 #### Option 2: Using srun (Frontier Supercomputer)
 ```bash
-cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts-frontier
-./n8-Small-XMoE.slurm
+cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts-frontier
+./run_exp_training.sh env_validate
 ```
 
 > **Note**: The first run may require an additional 10 minutes to compile kernels.

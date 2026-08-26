@@ -295,7 +295,7 @@ class PipelineParallelGrid:
         assert self._is_grid_valid(), "Invalid Grid"
         
         
-        # Init ELMoE PP ckpt partitions 
+        # Init X-MoE-4D PP ckpt partitions 
         self.custom_pipeline_partition = custom_pipeline_partition
         print (f'[deepspeed/runtime/pipe/topology.py] {self.custom_pipeline_partition=}')
 

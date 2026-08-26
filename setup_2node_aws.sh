@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# setup_2node_aws.sh — turn two fresh EC2 GPU instances into a working ELMoE
+# setup_2node_aws.sh — turn two fresh EC2 GPU instances into a working X-MoE-4D
 #                      multi-node cluster (non-SLURM / torchrun path).
 #
 # Companion to setup_env_cuda.sh, which builds the software env on ONE node.
@@ -16,7 +16,7 @@
 #                                                # before setup_env_cuda.sh, so the env
 #                                                # you build lands on the shared mount.
 #   ./setup_2node_aws.sh sshkey     <NODE2_IP>   # keygen + self-auth, print pubkey
-#   ./setup_2node_aws.sh nfs        <NODE2_IP>   # export ~/elmoe, mount on node 2
+#   ./setup_2node_aws.sh nfs        <NODE2_IP>   # export ~/xmoe-4d, mount on node 2
 #   ./setup_2node_aws.sh envfile    <NODE2_IP>   # write scripts/env.sh (auto-detects iface + EFA)
 #   ./setup_2node_aws.sh hostfile   <NODE2_IP>   # write scripts/hostfile
 #   ./setup_2node_aws.sh smoke      <NODE2_IP>   # 16-rank NCCL all-reduce
@@ -26,7 +26,7 @@
 #   1. security-group rule (console -- see below)
 #   2. ./setup_2node_aws.sh wire <NODE2_IP>      <- no env needed; ~2 min
 #   3. ./setup_env_cuda.sh                       <- ~40 min, lands on the shared mount
-#   4. bash .../examples_elmoe/data/prepare_data_ae.sh
+#   4. bash .../examples_xmoe_4d/data/prepare_data_ae.sh
 #   5. ./setup_2node_aws.sh all <NODE2_IP>       <- env.sh + smoke test (rest is idempotent)
 #
 #   NODE2_IP must be the PRIVATE ip. If you only have the public DNS name, resolve
@@ -63,10 +63,10 @@ case "$STAGE" in -h|--help|help) sed -n '2,45p' "$0" | sed 's/^#//; s/^ //'; exi
 
 # --- paths -------------------------------------------------------------------
 XMOE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ELMOE_ROOT="${ELMOE_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"   # the dir we NFS-export
-SCRIPTS="$XMOE_ROOT/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts"
-CONDA_ROOT="${CONDA_ROOT:-$ELMOE_ROOT/miniforge3}"
-ENV_PREFIX="${ENV_PREFIX:-$ELMOE_ROOT/ELMoE_envs/ELMoE-CUDA12.8_repro}"
+XMOE4D_ROOT="${XMOE4D_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"   # the dir we NFS-export
+SCRIPTS="$XMOE_ROOT/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts"
+CONDA_ROOT="${CONDA_ROOT:-$XMOE4D_ROOT/miniforge3}"
+ENV_PREFIX="${ENV_PREFIX:-$XMOE4D_ROOT/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro}"
 SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 
 NODE1="$(hostname -I | awk '{print $1}')"
@@ -90,7 +90,7 @@ stage_preflight() {
         warn "env exists but there is no conda at $CONDA_ROOT."
         warn "  Its base is probably another tree (setup_env_cuda.sh reuses any conda on PATH)."
         warn "  'envfile' will detect and use the real one; just be aware env.sh will point"
-        warn "  outside \$ELMOE_ROOT, so that path must exist on EVERY node too."
+        warn "  outside \$XMOE4D_ROOT, so that path must exist on EVERY node too."
     fi
     # A fresh `git clone` without --recursive leaves the submodule empty, so $SCRIPTS
     # does not exist. Saying only "scripts dir not found" sends people off to run the
@@ -182,7 +182,7 @@ stage_sshkey() {
     banner "ssh keys"
     # The launcher ssh's to EVERY host in the hostfile INCLUDING ITSELF, so node1
     # must be able to ssh to node1. This is easy to miss and fails only at launch.
-    [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -C "elmoe-$(hostname -s)" -f ~/.ssh/id_ed25519 >/dev/null
+    [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -C "xmoe-4d-$(hostname -s)" -f ~/.ssh/id_ed25519 >/dev/null
     mkdir -p ~/.ssh && chmod 700 ~/.ssh
     grep -qF "$(cut -d' ' -f2 ~/.ssh/id_ed25519.pub)" ~/.ssh/authorized_keys 2>/dev/null \
         || cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
@@ -225,31 +225,31 @@ EOF
 }
 
 stage_nfs() {
-    banner "shared filesystem (NFS export of $ELMOE_ROOT)"
+    banner "shared filesystem (NFS export of $XMOE4D_ROOT)"
     # A shared FS is NOT optional: the launcher writes node_launch.sh on node 1 and
     # then tells node 2 to run it AT THAT SAME ABSOLUTE PATH, and all ranks write
-    # rank_*.log into one JOB_DIR. Exporting the whole ELMOE_ROOT also gives node 2
+    # rank_*.log into one JOB_DIR. Exporting the whole XMOE4D_ROOT also gives node 2
     # the conda env, py-spy, the editable installs and the dataset for free.
     command -v exportfs >/dev/null || sudo dnf install -y nfs-utils >/dev/null 2>&1
-    if ! grep -qF "$ELMOE_ROOT $NODE2" /etc/exports 2>/dev/null; then
-        echo "$ELMOE_ROOT ${NODE2}(rw,sync,no_subtree_check,no_root_squash)" | sudo tee -a /etc/exports >/dev/null
+    if ! grep -qF "$XMOE4D_ROOT $NODE2" /etc/exports 2>/dev/null; then
+        echo "$XMOE4D_ROOT ${NODE2}(rw,sync,no_subtree_check,no_root_squash)" | sudo tee -a /etc/exports >/dev/null
     fi
     sudo systemctl enable --now nfs-server >/dev/null 2>&1
     sudo exportfs -ra
-    sudo exportfs -v | grep -qF "$ELMOE_ROOT" && ok "exported $ELMOE_ROOT -> $NODE2" || die "export failed"
+    sudo exportfs -v | grep -qF "$XMOE4D_ROOT" && ok "exported $XMOE4D_ROOT -> $NODE2" || die "export failed"
 
     ssh $SSH_OPTS "$NODE2" "command -v mount.nfs >/dev/null || sudo dnf install -y nfs-utils >/dev/null 2>&1"
-    if ssh $SSH_OPTS "$NODE2" "mountpoint -q '$ELMOE_ROOT'"; then
-        ok "node2 already has $ELMOE_ROOT mounted"
+    if ssh $SSH_OPTS "$NODE2" "mountpoint -q '$XMOE4D_ROOT'"; then
+        ok "node2 already has $XMOE4D_ROOT mounted"
     else
-        ssh $SSH_OPTS "$NODE2" "sudo mkdir -p '$ELMOE_ROOT' && sudo mount -t nfs ${NODE1}:${ELMOE_ROOT} '$ELMOE_ROOT'" \
+        ssh $SSH_OPTS "$NODE2" "sudo mkdir -p '$XMOE4D_ROOT' && sudo mount -t nfs ${NODE1}:${XMOE4D_ROOT} '$XMOE4D_ROOT'" \
             || die "mount failed on node2 (SG must allow NFS/2049 — the all-TCP rule covers it)"
         ok "mounted on node2"
     fi
     # survive reboots
-    ssh $SSH_OPTS "$NODE2" "grep -qF '$ELMOE_ROOT' /etc/fstab || echo '${NODE1}:${ELMOE_ROOT} ${ELMOE_ROOT} nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab >/dev/null"
+    ssh $SSH_OPTS "$NODE2" "grep -qF '$XMOE4D_ROOT' /etc/fstab || echo '${NODE1}:${XMOE4D_ROOT} ${XMOE4D_ROOT} nfs defaults,_netdev 0 0' | sudo tee -a /etc/fstab >/dev/null"
 
-    ssh $SSH_OPTS "$NODE2" "touch '$ELMOE_ROOT/.w' 2>/dev/null" && rm -f "$ELMOE_ROOT/.w" \
+    ssh $SSH_OPTS "$NODE2" "touch '$XMOE4D_ROOT/.w' 2>/dev/null" && rm -f "$XMOE4D_ROOT/.w" \
         && ok "node2 can write to the share (needed for the shared JOB_DIR)" \
         || die "node2 cannot WRITE to the share — check uid match and no_root_squash"
 }
@@ -260,7 +260,7 @@ stage_nfs() {
 # setup_env_cuda.sh only installs Miniforge when there is no conda anywhere:
 #     if [ ! -d "$CONDA_ROOT" ] && ! command -v conda >/dev/null; then install
 # So if the operator had ANY conda active while building (very likely when the same
-# person sets up a second tree, e.g. ~/elmoe_test then ~/elmoe), the new tree gets an
+# person sets up a second tree, e.g. ~/xmoe-4d_test then ~/xmoe-4d), the new tree gets an
 # env at $ENV_PREFIX but NO miniforge3 of its own. Writing the assumed path into
 # env.sh then breaks every rank with "no such file or directory", on every node.
 resolve_conda_root() {
@@ -277,7 +277,7 @@ resolve_conda_root() {
     fi
     # Nothing yet: this is the pre-build case (envfile running inside 'wire'). The
     # predicted path is not a guess -- setup_env_cuda.sh installs Miniforge to exactly
-    # $ELMOE_ROOT/miniforge3 -- so write it now and let 'all' re-verify afterwards.
+    # $XMOE4D_ROOT/miniforge3 -- so write it now and let 'all' re-verify afterwards.
     echo "$CONDA_ROOT"
 }
 
@@ -298,8 +298,8 @@ stage_envfile() {
         net_line="# EFA detected: letting NCCL auto-select the aws-ofi-nccl plugin (do NOT force NCCL_NET)."
     fi
 
-    ELMOE_ENV_TMP="$(mktemp)"
-    cat > "$ELMOE_ENV_TMP" <<EOF
+    XMOE4D_ENV_TMP="$(mktemp)"
+    cat > "$XMOE4D_ENV_TMP" <<EOF
 #!/bin/bash
 # Generated by setup_2node_aws.sh. Sourced by the DRIVER and by every node
 # (ssh carries no environment, so this file is how remote ranks get a usable shell).
@@ -321,11 +321,11 @@ export OMP_NUM_THREADS=1
 # torchrun sets the first three per worker, and pretrain_gpt_deepspeed.py reads
 # SLURM_PROCID BEFORE RANK -- exporting it makes every rank think it is rank 0.
 EOF
-    if [ -f "$SCRIPTS/env.sh" ] && ! cmp -s "$ELMOE_ENV_TMP" "$SCRIPTS/env.sh"; then
+    if [ -f "$SCRIPTS/env.sh" ] && ! cmp -s "$XMOE4D_ENV_TMP" "$SCRIPTS/env.sh"; then
         cp "$SCRIPTS/env.sh" "$SCRIPTS/env.sh.bak.$(date +%s)"
         info "existing env.sh differed — backed up"
     fi
-    mv "$ELMOE_ENV_TMP" "$SCRIPTS/env.sh"; chmod 644 "$SCRIPTS/env.sh"
+    mv "$XMOE4D_ENV_TMP" "$SCRIPTS/env.sh"; chmod 644 "$SCRIPTS/env.sh"
     ok "wrote $SCRIPTS/env.sh (iface=$ifc)"
     if [ -d "$ENV_PREFIX" ] && [ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
         env -i HOME="$HOME" PATH=/usr/bin:/bin bash --noprofile --norc -c \
@@ -347,7 +347,7 @@ stage_hostfile() {
 stage_smoke() {
     banner "NCCL smoke test (16 ranks)"
     local NPROC; NPROC=$(nvidia-smi -L | wc -l)
-    cat > "$ELMOE_ROOT/ar_smoke.py" <<'EOF'
+    cat > "$XMOE4D_ROOT/ar_smoke.py" <<'EOF'
 import os, torch, torch.distributed as dist
 lr = int(os.environ["LOCAL_RANK"])
 torch.cuda.set_device(lr)
@@ -362,7 +362,7 @@ EOF
     for h in "$NODE1" "$NODE2"; do
         ssh $SSH_OPTS "$h" "source '$SCRIPTS/env.sh' && torchrun --nnodes 2 --nproc_per_node $NPROC \
             --rdzv_backend c10d --rdzv_endpoint ${NODE1}:29500 --rdzv_id smoke \
-            '$ELMOE_ROOT/ar_smoke.py'" >>"$OUT" 2>&1 &
+            '$XMOE4D_ROOT/ar_smoke.py'" >>"$OUT" 2>&1 &
     done
     wait
     local EXPECT=$(( 2 * NPROC ))
@@ -387,7 +387,7 @@ EOF
 # ---------------------------------------------------------------------------
 # stage_wire — everything that does NOT need the conda env, so it can run FIRST.
 #
-# Doing this before ./setup_env_cuda.sh is the better order: once ~/elmoe is
+# Doing this before ./setup_env_cuda.sh is the better order: once ~/xmoe-4d is
 # NFS-exported, the env you build afterwards lands on the shared filesystem
 # automatically and node 2 sees it appear -- no "copy it over" step to forget, and
 # no chance of the two nodes drifting. It also surfaces security-group and ssh
@@ -402,9 +402,9 @@ stage_wire() {
     stage_envfile
     stage_hostfile
     banner "wiring done"
-    info "Node 2 now mounts $ELMOE_ROOT, so everything you install below is shared."
+    info "Node 2 now mounts $XMOE4D_ROOT, so everything you install below is shared."
     info "Next:  ./setup_env_cuda.sh                      (build the env, ~40 min)"
-    info "       cd $XMOE_ROOT/Megatron-DeepSpeed-X-MoE/examples_elmoe/data && bash prepare_data_ae.sh"
+    info "       cd $XMOE_ROOT/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data && bash prepare_data_ae.sh"
     info "       ./setup_2node_aws.sh all $NODE2          (writes env.sh + NCCL smoke test)"
 }
 

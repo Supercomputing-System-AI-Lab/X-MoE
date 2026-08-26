@@ -16,7 +16,7 @@ def detect_total_memory_gib():
     Used to derive the planner's memory limit as (total - headroom) instead of a
     hardcoded constant. Two properties are essential and easy to get wrong:
 
-    1. DETERMINISM ACROSS RANKS. The planner runs on EVERY rank (see ELMoE_launch.py),
+    1. DETERMINISM ACROSS RANKS. The planner runs on EVERY rank (see ELM_PP_launch.py),
        and all ranks must derive the SAME limit or they would compute different layer
        partitions and the run would corrupt. We therefore read *total* memory — a
        static hardware constant, identical on homogeneous nodes — and never free/

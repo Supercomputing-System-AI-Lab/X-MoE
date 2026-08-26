@@ -117,17 +117,17 @@ export CC=/opt/cray/pe/gcc-native/13/bin/gcc
 Navigate to the script directory and run the training:
 
 ```bash
-cd X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts-frontier
+cd X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts-frontier
 
-# Run with 8 GPUs on 1 node
-./n8-Small-XMoE.slurm
+# Environment warm-up run: X-MoE 10B, 8 GPUs on 1 node
+./run_exp_training.sh env_validate
 ```
 
 **Note**: The first run may require an additional 10 minutes to compile kernels
 Expectation:
 
 **Expectation**:
-After initialization, you can see the training logs during training progress in the terminal. The training logs will also be saved as `n8-Small-XMoE.log`.
+After initialization, you can see the training logs during training progress in the terminal. The training logs are collected under `scripts-frontier/logs/job_<ID>_.../` (`full_run.log`, per-rank `rank_*.log`).
 
 
 This training script will launch the training with micro batch size 4, sequence length 2048, and train a model based on DeepSeek-MoE architecture from scratch. **Expected throughput is ~50-55 TFLOPs with X-MoE optimizations.**

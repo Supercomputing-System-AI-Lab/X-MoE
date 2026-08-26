@@ -1,29 +1,29 @@
 #!/bin/bash
 ###############################################################################
-# setup_env_cuda.sh — ELMoE reviewer reproduction environment (NVIDIA / AWS)
+# setup_env_cuda.sh — X-MoE-4D reviewer reproduction environment (NVIDIA / AWS)
 #
-# NVIDIA counterpart of setup_env_rocm.sh. Builds the full ELMoE software stack
+# NVIDIA counterpart of setup_env_rocm.sh. Builds the full X-MoE-4D software stack
 # on an AWS EC2 GPU instance running the Amazon Linux 2023 Deep Learning AMI.
 #
 # ---------------------------------------------------------------------------
-# WHERE THINGS GO — one knob: ELMOE_ROOT
+# WHERE THINGS GO — one knob: XMOE4D_ROOT
 #
-#   ELMOE_ROOT=/scratch/elmoe ./setup_env_cuda.sh
+#   XMOE4D_ROOT=/scratch/xmoe-4d ./setup_env_cuda.sh
 #
 # That single variable relocates EVERYTHING this script writes:
 #
-#   $ELMOE_ROOT/ELMoE_envs/ELMoE-CUDA12.8_repro   conda environment
-#   $ELMOE_ROOT/ELMoE_deps/                       apex + flash-attn sources
-#   $ELMOE_ROOT/ELMoE_cache/                      pip + conda caches (these get big)
+#   $XMOE4D_ROOT/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro   conda environment
+#   $XMOE4D_ROOT/XMoE4D_deps/                          apex + flash-attn sources
+#   $XMOE4D_ROOT/XMoE4D_cache/                         pip + conda caches (these get big)
 #
 # Defaults to one level ABOVE the X-MoE checkout. Needs >= 25 GB free; the
 # script checks this UP FRONT and fails in seconds if short. Relocate with:
 #   local NVMe   -> sudo ./mount_scratch.sh /dev/nvme0n1 /scratch
-#                   ELMOE_ROOT=/scratch/elmoe ./setup_env_cuda.sh
-#   multi-node   -> ELMOE_ROOT=/fsx/elmoe   (a SHARED fs every node mounts)
+#                   XMOE4D_ROOT=/scratch/xmoe-4d ./setup_env_cuda.sh
+#   multi-node   -> XMOE4D_ROOT=/fsx/xmoe-4d   (a SHARED fs every node mounts)
 #
 # The X-MoE checkout itself is found from this script's own location, so the
-# repo can live anywhere -- including outside ELMOE_ROOT.
+# repo can live anywhere -- including outside XMOE4D_ROOT.
 #
 # ---------------------------------------------------------------------------
 # USAGE
@@ -41,7 +41,7 @@
 #                                  # aws-ofi-nccl plugin preinstalled.
 #
 #   There is NO primus stage on NVIDIA. primus_turbo is AMD-only (Composable
-#   Kernel, MI250+). ELMoE's portable Triton grouped-GEMM backend
+#   Kernel, MI250+). X-MoE-4D's portable Triton grouped-GEMM backend
 #   (FusedExperts_Triton) is the NVIDIA equivalent and needs no extra build --
 #   Triton ships inside the PyTorch wheel. Select it with use_triton=True.
 #
@@ -62,7 +62,7 @@
 #                     version 0.1, not 1.11.0; that is expected, not drift.
 #   aws-ofi-rccl   -> nothing to build. The DLAMI preinstalls aws-ofi-nccl.
 #
-# OVERRIDES: ELMOE_ROOT, ENV_PREFIX, DEPS_DIR, MAX_JOBS, TORCH_VERSION,
+# OVERRIDES: XMOE4D_ROOT, ENV_PREFIX, DEPS_DIR, MAX_JOBS, TORCH_VERSION,
 #            CUDA_VERSION, TORCH_CUDA_ARCH_LIST, APEX_TAG, FLASH_ATTN_VERSION
 ###############################################################################
 
@@ -76,21 +76,21 @@ XMOE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ~/X-MoE puts the env, deps, and caches alongside it as siblings:
 #
 #   ~/X-MoE/            <- the repo (this script lives here)
-#   ~/ELMoE_envs/       <- conda environment
-#   ~/ELMoE_deps/       <- apex + flash-attn sources
-#   ~/ELMoE_cache/      <- pip + conda caches
+#   ~/XMoE4D_envs/       <- conda environment
+#   ~/XMoE4D_deps/       <- apex + flash-attn sources
+#   ~/XMoE4D_cache/      <- pip + conda caches
 #
 # This keeps the checkout clean (nothing large is written inside the repo) and
-# mirrors how the ROCm script places its sibling ELMoE_deps/ folder.
-# Override to relocate everything at once, e.g. ELMOE_ROOT=/fsx/elmoe on a
-# multi-node cluster, or ELMOE_ROOT=/scratch/elmoe on a mounted local NVMe.
-ELMOE_ROOT="${ELMOE_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"
+# mirrors how the ROCm script places its sibling XMoE4D_deps/ folder.
+# Override to relocate everything at once, e.g. XMOE4D_ROOT=/fsx/xmoe-4d on a
+# multi-node cluster, or XMOE4D_ROOT=/scratch/xmoe-4d on a mounted local NVMe.
+XMOE4D_ROOT="${XMOE4D_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"
 
-# Everything below derives from ELMOE_ROOT, but each is independently overridable.
-# The ELMoE_* prefix matches the sibling ELMoE_deps/ folder the ROCm script creates.
-ENV_PREFIX="${ENV_PREFIX:-$ELMOE_ROOT/ELMoE_envs/ELMoE-CUDA12.8_repro}"
-DEPS_DIR="${DEPS_DIR:-$ELMOE_ROOT/ELMoE_deps}"
-CACHE_DIR="${CACHE_DIR:-$ELMOE_ROOT/ELMoE_cache}"
+# Everything below derives from XMOE4D_ROOT, but each is independently overridable.
+# The XMoE4D_* prefix matches the sibling XMoE4D_deps/ folder the ROCm script creates.
+ENV_PREFIX="${ENV_PREFIX:-$XMOE4D_ROOT/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro}"
+DEPS_DIR="${DEPS_DIR:-$XMOE4D_ROOT/XMoE4D_deps}"
+CACHE_DIR="${CACHE_DIR:-$XMOE4D_ROOT/XMoE4D_cache}"
 # Python 3.12, NOT the 3.11 of the ROCm env. This is deliberate: it is the only
 # Python for which upstream publishes a prebuilt flash-attn wheel against torch
 # 2.9 (see stage_flashattn). Trading the Python minor -- the least load-bearing
@@ -137,9 +137,9 @@ EFA_PATH="${EFA_PATH:-/opt/amazon/efa}"
 OFI_NCCL_PATH="${OFI_NCCL_PATH:-/opt/amazon/ofi-nccl}"
 
 MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
-CONDA_ROOT="${CONDA_ROOT:-$ELMOE_ROOT/miniforge3}"
+CONDA_ROOT="${CONDA_ROOT:-$XMOE4D_ROOT/miniforge3}"
 
-# Free space (GB) required under ELMOE_ROOT, checked BEFORE any stage runs so a
+# Free space (GB) required under XMOE4D_ROOT, checked BEFORE any stage runs so a
 # too-small volume fails in seconds rather than 25 minutes into the apex compile.
 # Measured on a completed build: 18 GB final (14 GB env — the in-env CUDA toolkit
 # is 2.7 GB of that — plus 3.5 GB caches), peaking ~22 GB during apex. 25 GB
@@ -161,27 +161,27 @@ info()    { printf "     %s\n" "$1"; }
 trap 'rc=$?; if [ $rc -ne 0 ]; then
   printf "\n${C_ERR}[FAILED]${C_OFF} stage \"%s\" exited %d.\n" "$CURRENT_STAGE" "$rc";
   printf "         Fix the error above, then re-run just this stage:\n";
-  printf "             ELMOE_ROOT=%s ./setup_env_cuda.sh %s\n" "$ELMOE_ROOT" "$CURRENT_STAGE";
+  printf "             XMOE4D_ROOT=%s ./setup_env_cuda.sh %s\n" "$XMOE4D_ROOT" "$CURRENT_STAGE";
 fi' EXIT
 
 # ---------------------------------------------------------------------------
 # shared setup (replaces the ROCm script's load_modules)
 # ---------------------------------------------------------------------------
 check_space() {
-    local parent="$ELMOE_ROOT" avail
+    local parent="$XMOE4D_ROOT" avail
     while [ ! -d "$parent" ]; do parent="$(dirname "$parent")"; done
     avail="$(df -BG --output=avail "$parent" | tail -1 | tr -dc '0-9')"
     if [ "${avail:-0}" -lt "$MIN_FREE_GB" ]; then
-        printf "${C_ERR}[FAILED]${C_OFF} only %s GB free on the filesystem holding ELMOE_ROOT=%s (need >= %s GB).\n" \
-               "$avail" "$ELMOE_ROOT" "$MIN_FREE_GB" >&2
+        printf "${C_ERR}[FAILED]${C_OFF} only %s GB free on the filesystem holding XMOE4D_ROOT=%s (need >= %s GB).\n" \
+               "$avail" "$XMOE4D_ROOT" "$MIN_FREE_GB" >&2
         cat >&2 <<EOF
          The full stack needs ~22 GB (14 GB conda env incl. the in-env CUDA
          toolkit, ~4 GB caches, plus apex build objects at peak).
-         Point ELMOE_ROOT at a bigger volume. On a fresh AWS GPU box the local
+         Point XMOE4D_ROOT at a bigger volume. On a fresh AWS GPU box the local
          NVMe is usually unformatted and unmounted:
 
              sudo ./mount_scratch.sh /dev/nvme0n1 /scratch
-             ELMOE_ROOT=/scratch/elmoe ./setup_env_cuda.sh
+             XMOE4D_ROOT=/scratch/xmoe-4d ./setup_env_cuda.sh
 
          (or grow the EBS root volume; or on multi-node, use a shared FSx/EFS path)
 EOF
@@ -242,28 +242,28 @@ write_activation_hook() {
     local act="$ENV_PREFIX/etc/conda/activate.d"
     local deact="$ENV_PREFIX/etc/conda/deactivate.d"
     mkdir -p "$act" "$deact"
-    cat > "$act/zzz-elmoe-cuda.sh" <<'HOOK'
+    cat > "$act/zzz-xmoe-4d-cuda.sh" <<'HOOK'
 #!/bin/bash
-# Written by setup_env_cuda.sh (ELMoE). See write_activation_hook() there for why.
+# Written by setup_env_cuda.sh (X-MoE-4D). See write_activation_hook() there for why.
 # torch.utils.cpp_extension adds only "$CUDA_HOME/include"; conda's CUDA headers
 # live under targets/<arch>/include. Without both vars, JIT fused-kernel builds
 # fail with: fatal error: cuda_fp16.h: No such file or directory
-_elmoe_targets="$CONDA_PREFIX/targets/x86_64-linux"
-export ELMOE_CUDA_HOME_BACKUP="${CUDA_HOME:-}"
-export ELMOE_CPATH_BACKUP="${CPATH:-}"
+_xmoe4d_targets="$CONDA_PREFIX/targets/x86_64-linux"
+export XMOE4D_CUDA_HOME_BACKUP="${CUDA_HOME:-}"
+export XMOE4D_CPATH_BACKUP="${CPATH:-}"
 export CUDA_HOME="$CONDA_PREFIX"
-[ -d "$_elmoe_targets/include" ] && export CPATH="$_elmoe_targets/include${CPATH:+:$CPATH}"
-unset _elmoe_targets
+[ -d "$_xmoe4d_targets/include" ] && export CPATH="$_xmoe4d_targets/include${CPATH:+:$CPATH}"
+unset _xmoe4d_targets
 HOOK
-    cat > "$deact/zzz-elmoe-cuda.sh" <<'HOOK'
+    cat > "$deact/zzz-xmoe-4d-cuda.sh" <<'HOOK'
 #!/bin/bash
-# Written by setup_env_cuda.sh (ELMoE). Restores what zzz-elmoe-cuda.sh replaced.
-if [ -n "${ELMOE_CUDA_HOME_BACKUP:-}" ]; then export CUDA_HOME="$ELMOE_CUDA_HOME_BACKUP"; else unset CUDA_HOME; fi
-if [ -n "${ELMOE_CPATH_BACKUP:-}" ];     then export CPATH="$ELMOE_CPATH_BACKUP";         else unset CPATH;     fi
-unset ELMOE_CUDA_HOME_BACKUP ELMOE_CPATH_BACKUP
+# Written by setup_env_cuda.sh (X-MoE-4D). Restores what zzz-xmoe-4d-cuda.sh replaced.
+if [ -n "${XMOE4D_CUDA_HOME_BACKUP:-}" ]; then export CUDA_HOME="$XMOE4D_CUDA_HOME_BACKUP"; else unset CUDA_HOME; fi
+if [ -n "${XMOE4D_CPATH_BACKUP:-}" ];     then export CPATH="$XMOE4D_CPATH_BACKUP";         else unset CPATH;     fi
+unset XMOE4D_CUDA_HOME_BACKUP XMOE4D_CPATH_BACKUP
 HOOK
-    chmod +x "$act/zzz-elmoe-cuda.sh" "$deact/zzz-elmoe-cuda.sh"
-    ok "activation hook written: $act/zzz-elmoe-cuda.sh"
+    chmod +x "$act/zzz-xmoe-4d-cuda.sh" "$deact/zzz-xmoe-4d-cuda.sh"
+    ok "activation hook written: $act/zzz-xmoe-4d-cuda.sh"
     info "CUDA_HOME + CPATH now set by \`conda activate $ENV_PREFIX\` alone."
 }
 
@@ -279,7 +279,7 @@ activate_env() {
     # builds below (apex, flash-attn) and the verify compile need the headers too.
     [ -d "$CONDA_PREFIX/targets/x86_64-linux/include" ] && \
         export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
-    info "root:   $ELMOE_ROOT"
+    info "root:   $XMOE4D_ROOT"
     info "python: $(which python)  ($(python --version 2>&1))"
     command -v nvcc >/dev/null 2>&1 && \
         info "nvcc:   $(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')  ($(which nvcc))"
@@ -312,7 +312,7 @@ PY
 stage_conda() {
     CURRENT_STAGE="conda"; banner "conda env ($ENV_PREFIX, python $PYTHON_VERSION)"
     check_space
-    mkdir -p "$ELMOE_ROOT" "$DEPS_DIR" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$TMPDIR"
+    mkdir -p "$XMOE4D_ROOT" "$DEPS_DIR" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$TMPDIR"
     if [ ! -d "$CONDA_ROOT" ] && ! command -v conda >/dev/null 2>&1; then
         info "no conda on this box — installing Miniforge3 to $CONDA_ROOT"
         curl -fsSL "$MINIFORGE_URL" -o "$TMPDIR/miniforge.sh"
@@ -538,7 +538,7 @@ stage_efa() {
         ok "EFA device(s) present on this instance (${nics} endpoint(s) reported)."
     else
         warn "No EFA device on this instance — expected on g5/g6 (they have none)."
-        warn "Multi-node ELMoE needs p4d/p5/p6 with EFA enabled on every network card."
+        warn "Multi-node X-MoE-4D needs p4d/p5/p6 with EFA enabled on every network card."
     fi
 
     printf "\n${C_HEAD}============ what to actually set for multi-node ============${C_OFF}\n"
@@ -637,7 +637,7 @@ print_activation_help() {
       python -c "import torch, six, deepspeed, megatron; print(torch.cuda.device_count())"
 
   Batch / multi-node — do NOT rely on your login shell. ssh carries no
-  environment, so put the two lines above in examples_elmoe/scripts/env.sh
+  environment, so put the two lines above in examples_xmoe_4d/scripts/env.sh
   (copy env.sh.example). Both the driver and every node source that file.
 
   Re-check the env at any time:
@@ -707,7 +707,7 @@ run_all() {
     # Echo every resolved path and pin, so a reviewer can see exactly what their
     # overrides produced before a 30-minute build starts.
     info "repo:       $XMOE_ROOT"
-    info "ELMOE_ROOT: $ELMOE_ROOT"
+    info "XMOE4D_ROOT: $XMOE4D_ROOT"
     info "env:        $ENV_PREFIX"
     info "deps:       $DEPS_DIR"
     info "cache:      $CACHE_DIR"
@@ -744,7 +744,7 @@ case "$STAGE" in
     primus)
         trap - EXIT
         echo "primus_turbo is AMD-only (Composable Kernel, MI250+); there is no primus stage on" >&2
-        echo "NVIDIA. Use ELMoE's Triton grouped-GEMM backend instead: use_triton=True." >&2
+        echo "NVIDIA. Use X-MoE-4D's Triton grouped-GEMM backend instead: use_triton=True." >&2
         exit 1 ;;
     -h|--help|help)
         sed -n '2,60p' "$0" | sed 's/^#//; s/^ //'

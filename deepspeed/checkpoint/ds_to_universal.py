@@ -36,6 +36,7 @@ from deepspeed.checkpoint import (
     PARAM_GROUPS,
     PARAM_SLICE_MAPPINGS,
     MOE_UCP_INFO,
+    GROUP_PADDINGS,   # [X-MoE, 2026-09-06] used by index_zero_shard (--fragments-inplace)
     PARAM_SHAPES,
     PARAM,
     CAT_DIM,
@@ -139,6 +140,12 @@ def parse_arguments():
         help='[X-MoE, 2026-09-05] Extract phase writes ONE raw container per ZeRO shard plus an index instead of '
         'one file per (parameter, state, shard); the merge reads fragments by offset. Same atoms, '
         'far fewer files (19k-95k fewer creates and reads for the 10B on Frontier Lustre). Stage 1/2 only.')
+    parser.add_argument(
+        '--fragments-inplace',
+        action='store_true',
+        help='[X-MoE, 2026-09-06, proposal C0] No extract copy at all: each ZeRO shard is indexed (its pickle is read, '
+        'no tensor bytes) and the merge reads every fragment by byte offset straight out of the shard. Implies the '
+        'container-mode merge path; the shards are opened read-only and never modified. Stage 1/2 only.')
     parser.add_argument(
         '--optstate-from-pickle',
         action='store_true',
@@ -792,6 +799,89 @@ _NUMPY_DTYPE_OF = {torch.float32: 'float32', torch.float64: 'float64', torch.flo
                    torch.int64: 'int64', torch.int32: 'int32', torch.uint8: 'uint8', torch.int8: 'int8', torch.int16: 'int16'}
 
 
+def index_zero_shard(temp_dir, ds_checkpoint, indices_3D):
+    """extract_zero_shards_container without the copy: the container IS the shard. Writes
+    tmp/shard_ppP_tpT_dpD.idx with 'bin' = the shard path and one ('frag', byte offset, numel, dtype)
+    entry per (parameter, out_tp, state); build_container_index then merges the .idx files exactly
+    as in the container mode. Reads the shard's pickle only (no tensor bytes); opens nothing for writing
+    under the input folder."""
+    pp_index, tp_index, dp_index = indices_3D
+    t_task0 = time.perf_counter_ns() if _TIMING else 0
+    files = ds_checkpoint.zero_checkpoint.get_files_for_rank(pp_index, tp_index, dp_index)
+    if len(files) != 1:
+        raise RuntimeError(f'--fragments-inplace needs exactly one shard per (pp, tp, dp) rank; rank {indices_3D} maps to {files}')
+    shard_path = os.path.abspath(files[0])
+    if os.path.realpath(shard_path).startswith(os.path.realpath(temp_dir) + os.sep):
+        raise RuntimeError(f'shard {shard_path} lies inside the temporary folder {temp_dir}; refusing (it would be deleted)')
+    t0 = time.perf_counter_ns() if _TIMING else 0
+    sd, record_offsets, pkl_bytes = _load_shard_meta(shard_path)
+    if _TIMING:
+        _timing_record('shard_index_meta', f'pp{pp_index}_tp{tp_index}_dp{dp_index}', '', tp_index, dp_index, shard_path,
+                       pkl_bytes, t0, time.perf_counter_ns(), f'n_records={len(record_offsets)}')
+    optim_sd = sd[OPTIMIZER_STATE_DICT]
+    if 'moe_ucp_rank' in optim_sd:
+        raise RuntimeError('rank-local expert names are no longer supported; re-save the checkpoint with a current build')
+    param_slice_mappings = optim_sd[PARAM_SLICE_MAPPINGS]
+    experts_are_replicated = not (ds_checkpoint._get_checkpoint_value(MOE_UCP_INFO) or {}).get(
+        'expert_tensor_parallel', False)
+    universal_checkpoint_info = ds_checkpoint.get_checkpoint_info(UNIVERSAL_CHECKPOINT_INFO)
+    pipeline_replicated_params = universal_checkpoint_info.get(PIPELINE_REPLICATED_PARAMETER_PATTERNS, [])
+    state_groups = optim_sd[BASE_OPTIMIZER_STATE]["state"]
+    fp32_groups = optim_sd[SINGLE_PARTITION_OF_FP32_GROUPS]
+    group_paddings = optim_sd.get(GROUP_PADDINGS) or [0] * len(state_groups)
+    _, idx_path = _container_paths(temp_dir, pp_index, tp_index, dp_index)
+    os.makedirs(temp_dir, exist_ok=True)
+    index = {}
+    n_frag = 0
+    for param_group_id in range(len(state_groups)):
+        flat_state = dict(
+            exp_avg=state_groups[param_group_id]["exp_avg"],
+            exp_avg_sq=state_groups[param_group_id]["exp_avg_sq"],
+            fp32=fp32_groups[param_group_id],
+        )
+        if "step" in state_groups[param_group_id]:
+            flat_state["step"] = state_groups[param_group_id]["step"]
+        for name, fragment_mapping in param_slice_mappings[param_group_id].items():
+            if pp_index > 0 and any(re.match(pattern, name) for pattern in pipeline_replicated_params):
+                continue
+            out_tp = 0 if (experts_are_replicated and is_expert_param_name(name)) else tp_index
+            for state_key, flat in flat_state.items():
+                if state_key == "step" or not isinstance(flat, _TensorRef):
+                    if isinstance(flat, _TensorRef):   # a 0-d tensor step: read its one value
+                        itemsize = torch.empty((), dtype=flat.dtype).element_size()
+                        fd = os.open(shard_path, os.O_RDONLY)
+                        try:
+                            raw = os.pread(fd, itemsize, record_offsets[flat.key] + flat.storage_offset * itemsize)
+                        finally:
+                            os.close(fd)
+                        value = torch.frombuffer(bytearray(raw), dtype=flat.dtype).item()
+                    else:
+                        value = flat
+                    index[(name, out_tp, state_key)] = ('value', value)
+                    continue
+                if flat.dtype not in _NUMPY_DTYPE_OF:
+                    raise RuntimeError(f'--fragments-inplace: unsupported dtype {flat.dtype} for {name}/{state_key}')
+                itemsize = torch.empty((), dtype=flat.dtype).element_size()
+                start, numel = int(fragment_mapping.start), int(fragment_mapping.numel)
+                usable = flat.numel - int(group_paddings[param_group_id] or 0)
+                if start < 0 or start + numel > usable:
+                    raise RuntimeError(f'--fragments-inplace: fragment {name}/{state_key} [{start}, {start + numel}) '
+                                       f'outside the unpadded partition of {usable} elements (group {param_group_id}, shard {shard_path})')
+                offset_bytes = record_offsets[flat.key] + (flat.storage_offset + start) * itemsize
+                index[(name, out_tp, state_key)] = ('frag', offset_bytes, numel, _NUMPY_DTYPE_OF[flat.dtype])
+                n_frag += 1
+    t_idx0 = time.perf_counter_ns() if _TIMING else 0
+    with open(idx_path, 'wb') as fh:
+        pickle.dump({'bin': shard_path, 'dp': dp_index, 'entries': index}, fh)
+    if _TIMING:
+        shard = f'pp{pp_index}_tp{tp_index}_dp{dp_index}'
+        _timing_record('index_write', shard, '', tp_index, dp_index, idx_path, _timing_getsize(idx_path), t_idx0,
+                       time.perf_counter_ns(), f'n_entries={len(index)}')
+        _timing_record('extract_task', shard, '', tp_index, dp_index, temp_dir, '', t_task0, time.perf_counter_ns(),
+                       f'mode=inplace;n_frag={n_frag}')
+    return n_frag
+
+
 def _save_optimizer_state_from_pickle(args, ds_checkpoint):
     """C9: the same output as _save_optimizer_state, built from each stage's shard pickle instead of the
     whole shard. Returns True when zero/optimizer_state.pt was written; False (nothing written) when the
@@ -1024,6 +1114,15 @@ def _extract_zero_shard_files(args, ds_checkpoint, temp_dir):
 
     if _TIMING:
         _timing_set_role('extract')
+    if getattr(args, 'fragments_inplace', False):
+        print('*** fragments in place: no extract copy; an index per ZeRO shard points the merge at the shard itself')
+        do_work = partial(index_zero_shard, temp_dir, ds_checkpoint)
+        _do_parallel_work(do_work, _3d_range_list, num_workers)
+        t0, t_abs0 = (time.perf_counter_ns(), time.time()) if _TIMING else (0, 0.0)
+        build_container_index(temp_dir)
+        if _TIMING:
+            _timing_phase_end('index_build', t0, t_abs0, f'path={os.path.join(temp_dir, "index.pkl")};mode=inplace')
+        return
     if getattr(args, 'fragment_container', False):
         print('*** fragment containers: one raw file + index per ZeRO shard instead of per-fragment files')
         do_work = partial(extract_zero_shards_container, temp_dir, ds_checkpoint)

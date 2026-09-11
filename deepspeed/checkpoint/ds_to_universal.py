@@ -11,10 +11,15 @@ import argparse
 import glob
 import itertools
 import math
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 import re
 import shutil
+import socket
+import sys
+import time
+import csv
+import json
 import torch
 import tqdm
 #from pprint import pprint
@@ -177,6 +182,187 @@ def _create_checkpoint_paths(base_folder, iteration, tp_degree, pp_degree):
     return path_list
 
 
+# ----------------------------------------------------------------------------------------------
+# [X-MoE, 2026-09-05] Per-event timing. UCP_TIMING_DIR=<dir> turns it on; unset (or empty) leaves
+# every site below at one module-global bool test -- no file, no stat(), no print, same output.
+#
+# The conversion's cost is spread over 10^4-10^5 small file events in forked worker processes, and
+# nothing the converter prints says when any of them happened: the tqdm bars carry no task identity
+# and the campaign's awk-stamped log records pipe-arrival times, not event times (ucp_io round 2,
+# protocol R1/R8). With the variable set, every process -- the main process and each
+# ProcessPoolExecutor worker -- appends one row per event to its OWN file
+# <dir>/<role>_<hostname>_<pid>.csv. One file per pid because a forked worker inherits the parent's
+# handle: the handle is keyed by os.getpid() and re-opened in the child, and since workers leave
+# through os._exit (no atexit, no flush) the file is line-buffered. The pid in the file name joins
+# the rows to Darshan's per-process logs. Absolute time is anchored once per file (the '#' line and
+# the 'proc' row carry time.time() next to the matching perf_counter_ns); events carry
+# perf_counter_ns t0/t1 only.
+#
+# Columns: event,name,state,tp,dp,path,nbytes,t0_ns,t1_ns,extra. Events: proc, shard_load,
+# extract_task, frag_write, container_frag, container_flush, index_write, frag_read, container_read,
+# atom_write, merge_task, optstate_write; from the main process the phase rows startup, extract,
+# index_build (inside extract), merge, optstate, cleanup, copy_mp, total (absolute times in extra),
+# one '*** PHASES {json}' line and <output_folder>/CONVERSION_PHASES.json.
+# ----------------------------------------------------------------------------------------------
+_TIMING_DIR = os.path.abspath(os.environ['UCP_TIMING_DIR']) if os.environ.get('UCP_TIMING_DIR') else None
+_TIMING = _TIMING_DIR is not None
+_TIMING_T0_NS = time.perf_counter_ns() if _TIMING else 0    # end of module import (torch, deepspeed)
+_TIMING_T0_ABS = time.time() if _TIMING else 0.0
+_TIMING_ROLE = 'main'       # set by the main process before each pool is forked; inherited by the workers
+_TIMING_FH = None           # (file, csv.writer) opened by THIS pid, or None
+_TIMING_PID = None          # pid that opened _TIMING_FH; a forked child sees its parent's pid here
+_TIMING_PHASES = {}         # main process: phase -> seconds, for CONVERSION_PHASES.json
+_TIMING_FAILED_PID = None   # pid whose timing sink failed: that process records nothing more (see _timing_record)
+
+
+def _timing_proc_start_abs():
+    """Process start as epoch seconds from /proc (10 ms resolution), so the interpreter start and the
+    imports that precede _TIMING_T0_ABS are on the same clock. '' if unavailable."""
+    try:
+        with open('/proc/self/stat') as fh:
+            start_ticks = int(fh.read().rsplit(')', 1)[1].split()[19])
+        with open('/proc/stat') as fh:
+            btime = next(int(line.split()[1]) for line in fh if line.startswith('btime '))
+        return btime + start_ticks / os.sysconf('SC_CLK_TCK')
+    except Exception:
+        return ''
+
+
+def _timing_writer():
+    global _TIMING_FH, _TIMING_PID
+    pid = os.getpid()
+    if _TIMING_FH is None or _TIMING_PID != pid:
+        os.makedirs(_TIMING_DIR, exist_ok=True)
+        host = socket.gethostname()
+        fh = open(os.path.join(_TIMING_DIR, f'{_TIMING_ROLE}_{host}_{pid}.csv'), 'w', buffering=1, newline='')
+        t_abs, t_ns = time.time(), time.perf_counter_ns()
+        fh.write(f'# t_abs_start={t_abs!r} t_pc_start_ns={t_ns} host={host} pid={pid} ppid={os.getppid()} '
+                 f'role={_TIMING_ROLE}\n')
+        writer = csv.writer(fh, lineterminator='\n')
+        writer.writerow(['event', 'name', 'state', 'tp', 'dp', 'path', 'nbytes', 't0_ns', 't1_ns', 'extra'])
+        writer.writerow([
+            'proc', host, '', '', '', '', '', t_ns, t_ns,
+            f'pid={pid};ppid={os.getppid()};t_abs={t_abs!r};role={_TIMING_ROLE};'
+            f'proc_start_abs={_timing_proc_start_abs()};module_t0_abs={_TIMING_T0_ABS!r};'
+            f'module_t0_ns={_TIMING_T0_NS};python={sys.version.split()[0]}'
+        ])
+        _TIMING_FH, _TIMING_PID = (fh, writer), pid
+    return _TIMING_FH[1]
+
+
+def _timing_record(event, name='', state='', tp='', dp='', path='', nbytes='', t0=0, t1=0, extra=''):
+    """Never raises: a failing timing sink (unwritable UCP_TIMING_DIR, ENOSPC/EDQUOT on the CSV) must not fail a
+    worker task or the conversion. On the first failure the process prints one line to stderr and records
+    nothing more; a forked child, whose pid differs, tries its own file once."""
+    global _TIMING_FAILED_PID
+    pid = os.getpid()
+    if _TIMING_FAILED_PID == pid:
+        return
+    try:
+        _timing_writer().writerow([event, name, state, tp, dp, path, nbytes, t0, t1, extra])
+    except Exception as e:
+        _TIMING_FAILED_PID = pid
+        print(f'*** UCP_TIMING_DIR: timing disabled in pid {pid} ({_TIMING_ROLE}) after {type(e).__name__}: {e}',
+              file=sys.stderr)
+
+
+def _timing_getsize(path):
+    """os.path.getsize for a timing row: '' instead of an exception."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return ''
+
+
+def _timing_set_role(role):
+    """Main process, before a pool is forked: the workers inherit the role for their file name."""
+    global _TIMING_ROLE
+    _TIMING_ROLE = role
+
+
+def _timing_nbytes(x):
+    return x.numel() * x.element_size() if torch.is_tensor(x) else 0
+
+
+def _timing_shard_load(ds_checkpoint, indices_3D, t0, t1, extra=''):
+    """shard_load row for one whole-shard torch.load: nbytes from the file size(s), path(s) ';'-joined."""
+    pp_index, tp_index, dp_index = indices_3D
+    try:
+        files = ds_checkpoint.get_zero_files(pp_index=pp_index, tp_index=tp_index, dp_index=dp_index)
+        path, nbytes = ';'.join(files), sum(os.path.getsize(f) for f in files)
+    except Exception:
+        path, nbytes = '', ''
+    _timing_record('shard_load', f'pp{pp_index}_tp{tp_index}_dp{dp_index}', '', tp_index, dp_index, path, nbytes, t0,
+                   t1, extra)
+
+
+def _timing_frag_read(path, name, state, tp_index, dp_index):
+    """frag_read row around one fragment file's torch.load (file mode); one os.path.getsize per read."""
+    t0 = time.perf_counter_ns()
+    sd = load_checkpoint_file(path)
+    t1 = time.perf_counter_ns()
+    _timing_record('frag_read', name, state, tp_index, dp_index, path, _timing_getsize(path), t0, t1)
+    return sd
+
+
+def _timing_container_read(entry, name, state, tp_index, dp_index):
+    """container_read row around one _read_fragment (the seek + pread primitive); offset in extra."""
+    t0 = time.perf_counter_ns()
+    frag = _read_fragment(entry)
+    t1 = time.perf_counter_ns()
+    _timing_record('container_read', name, state, tp_index, dp_index, entry[0], _timing_nbytes(frag), t0, t1,
+                   f'offset={entry[1]}')
+    return frag
+
+
+def _timing_phase_end(event, t0, t_abs0, extra=''):
+    """Main process: close the phase that began at (t0, t_abs0) -- one row, seconds into _TIMING_PHASES --
+    and return the (perf_counter_ns, time.time()) pair the next phase starts from."""
+    t1, t_abs1 = time.perf_counter_ns(), time.time()
+    _timing_record(event, t0=t0, t1=t1, extra=f't_abs0={t_abs0!r};t_abs1={t_abs1!r}' + (';' + extra if extra else ''))
+    _TIMING_PHASES[event] = (t1 - t0) / 1e9
+    return t1, t_abs1
+
+
+def _timing_phases_report(args):
+    """Main process, once, after the universal checkpoint is complete: the 'total' row, one
+    '*** PHASES {json}' line and <output_folder>/CONVERSION_PHASES.json. The file sits in the output
+    root: post_convert.sh counts the directories under zero/ as atoms and tmp/ is removed."""
+    try:
+        t1, t_abs1 = time.perf_counter_ns(), time.time()
+        _timing_record('total', t0=_TIMING_T0_NS, t1=t1, extra=f't_abs0={_TIMING_T0_ABS!r};t_abs1={t_abs1!r}')
+        partition = ['startup', 'extract', 'merge', 'optstate', 'cleanup', 'copy_mp']
+        total_s = (t1 - _TIMING_T0_NS) / 1e9
+        sum_s = sum(_TIMING_PHASES.get(p, 0.0) for p in partition)
+        proc_start = _timing_proc_start_abs()
+        report = {f'{p}_s': round(s, 6) for p, s in _TIMING_PHASES.items()}
+        report.update({
+            'total_s': round(total_s, 6),
+            'sum_phases_s': round(sum_s, 6),
+            'residual_s': round(total_s - sum_s, 6),
+            'phases_partition': partition,
+            'index_build_inside_extract': True,
+            'import_s': round(_TIMING_T0_ABS - proc_start, 3) if proc_start != '' else None,
+            'host': socket.gethostname(),
+            'pid': os.getpid(),
+            't_start_abs': _TIMING_T0_ABS,
+            't_end_abs': t_abs1,
+            'proc_start_abs': proc_start if proc_start != '' else None,
+            'mode': 'container' if getattr(args, 'fragment_container', False) else 'file',
+            'workers_extract': args.num_extract_workers,
+            'workers_merge': args.num_merge_workers,
+            'input_folder': args.input_folder,
+            'output_folder': args.output_folder,
+            'timing_dir': _TIMING_DIR,
+            'python': sys.version.split()[0],
+        })
+        print('*** PHASES ' + json.dumps(report))
+        with open(os.path.join(args.output_folder, 'CONVERSION_PHASES.json'), 'w') as fh:
+            json.dump(report, fh, indent=1)
+    except Exception as e:
+        print(f'*** UCP_TIMING_DIR: CONVERSION_PHASES.json not written after {type(e).__name__}: {e}', file=sys.stderr)
+
+
 def _save_checkpoint(file_path, chkpt_sd):
     dir, _ = os.path.split(file_path)
     os.makedirs(dir, exist_ok=True)
@@ -185,7 +371,11 @@ def _save_checkpoint(file_path, chkpt_sd):
 
 def extract_zero_shards(dir, ds_checkpoint, indices_3D):
     pp_index, tp_index, dp_index = indices_3D
+    t_task0 = time.perf_counter_ns() if _TIMING else 0
     sd = ds_checkpoint.get_zero_checkpoint_state(pp_index=pp_index, tp_index=tp_index, dp_index=dp_index)
+    if _TIMING:
+        _timing_shard_load(ds_checkpoint, indices_3D, t_task0, time.perf_counter_ns())
+        cnt0 = cnt
 
     # pprint(f"Processing {dp_index=} {pp_index=}, {tp_index=}")
 
@@ -248,6 +438,9 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
             for state_key in flat_state.keys():
                 dump_param_fragment(dir, out_tp, dp_index, state_key, flat_state[state_key], name,
                                     fragment_mapping.start, fragment_mapping.numel)
+    if _TIMING:
+        _timing_record('extract_task', f'pp{pp_index}_tp{tp_index}_dp{dp_index}', '', tp_index, dp_index, dir, '',
+                       t_task0, time.perf_counter_ns(), f'mode=file;n_frag={cnt - cnt0}')
 
 
 def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, dp_index):
@@ -291,9 +484,14 @@ def dump_param_fragment(dir, tp_index, dp_index, state_name, state_flat_tensor, 
     #print(f"{param_name}: {offset}: {numel} => {path}")
 
     # State might be a python int or a tensor
+    t0 = time.perf_counter_ns() if _TIMING else 0
     if state_name != "step" and torch.is_tensor(state_flat_tensor):
         state_flat_tensor = state_flat_tensor.narrow(0, offset, numel).clone()
+    t1 = time.perf_counter_ns() if _TIMING else 0
     _save_checkpoint(path, state_flat_tensor)
+    if _TIMING:
+        _timing_record('frag_write', param_name, state_name, tp_index, dp_index, path, _timing_nbytes(state_flat_tensor),
+                       t1, time.perf_counter_ns(), f'clone_ns={t1 - t0}')
 
 
 def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
@@ -315,7 +513,13 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
                 raise ValueError(f"Cannot parse dp_rank from {p}")
 
         paths = [f"{prefix_path}.{dp_index_to_str(dp_index)}" for dp_index in sorted(list(dp_indices))]
-        shards = [torch.load(p) for p in paths]
+        if _TIMING:
+            shards = [
+                _timing_frag_read(p, os.path.basename(param_base_path), state, tp_index, dp)
+                for dp, p in zip(sorted(dp_indices), paths)
+            ]
+        else:
+            shards = [load_checkpoint_file(p) for p in paths]
 
         if state == "step":
             assert all(v == shards[0] for v in shards), "All shards must have the same step value"
@@ -333,6 +537,7 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
 def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
     name, shape = name_and_shape
+    t_task0 = time.perf_counter_ns() if _TIMING else 0
     slice_base_path = os.path.join(slice_dir, name)
     param_base_path = os.path.join(dir, name)
 
@@ -370,10 +575,15 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
     step_merged = _merge_zero_shards(slice_base_path, "step", tp_degree, shape)
     if step_merged:
+        t0 = time.perf_counter_ns() if _TIMING else 0
         _save_checkpoint(os.path.join(param_base_path, f"step.pt"), step_merged[0])
+        if _TIMING:
+            _timing_record('atom_write', name, 'step', '', '', os.path.join(param_base_path, "step.pt"),
+                           _timing_nbytes(step_merged[0]), t0, time.perf_counter_ns())
 
     for state in ("fp32", "exp_avg", "exp_avg_sq"):
-        slices = _merge_zero_shards(slice_base_path, state, tp_degree, shape)
+        t_read0 = time.perf_counter_ns() if _TIMING else 0
+        t_read1 = time.perf_counter_ns() if _TIMING else 0
         final_path = os.path.join(param_base_path, f"{state}.pt")
 
         #print(f"Expected shape: {shape}")
@@ -432,7 +642,14 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
         #print(f"Final shape: {param.shape}")
         ckpt_dict[PARAM] = param
         _save_checkpoint(final_path, ckpt_dict)
+        if _TIMING:
+            _timing_record('atom_write', name, state, '', '', final_path, _timing_nbytes(param), t0,
+                           time.perf_counter_ns(),
+                           f'n_slices={len(slices)};read_ns={t_read1 - t_read0};merge_ns={t0 - t_read1}')
 
+    if _TIMING:
+        _timing_record('merge_task', name, '', tp_degree, '', param_base_path, '', t_task0, time.perf_counter_ns(),
+                       f'n_slices={len(slices)}')
     return unmatched_patterns
 
 
@@ -451,7 +668,12 @@ def _do_parallel_work(do_work, work_chunks, num_workers):
     if num_workers > 1:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             future_list = [executor.submit(do_work, work) for work in work_chunks]
-            for f in tqdm.tqdm(future_list):
+            # as_completed, not submission order: iterating the list in order leaves the progress
+            # bar pinned at 0% until the FIRST task finishes, which on a multi-minute extract is
+            # indistinguishable from a hang -- and a killed conversion leaves a stale tmp/ behind.
+            # Safe because the one caller that uses the return value intersects the results as
+            # sets, so ordering carries no information.
+            for f in tqdm.tqdm(as_completed(future_list), total=len(future_list)):
                 results.append(f.result())
     else:
         # No parallel pass for unit testing
@@ -467,16 +689,34 @@ def _extract_zero_shard_files(args, ds_checkpoint, temp_dir):
                           range(ds_checkpoint.dp_degree)))
     #pprint(f'{_3d_range_list=}')
 
+    # One task == one ZeRO shard, held whole in memory by its worker. Workers beyond the task
+    # count do nothing but still cost a process, and each concurrent worker costs one shard of RAM
+    # -- tens of GiB for a large MoE model. Clamp, and say so.
+    num_workers = min(args.num_extract_workers, len(_3d_range_list))
+    if num_workers != args.num_extract_workers:
+        print(f'*** Clamping --num_extract_workers {args.num_extract_workers} -> {num_workers} '
+              f'(only {len(_3d_range_list)} ZeRO shards to extract)')
+
+    shard_gib = os.path.getsize(ds_checkpoint.zero_checkpoint.file_list[0]) / 2**30
+    print(f'*** Extracting {len(_3d_range_list)} ZeRO shards of {shard_gib:.1f} GiB with '
+          f'{num_workers} worker(s): expect up to ~{num_workers * shard_gib:.0f} GiB resident')
+
+    if _TIMING:
+        _timing_set_role('extract')
     do_work = partial(extract_zero_shards, temp_dir, ds_checkpoint)
-    _do_parallel_work(do_work, _3d_range_list, args.num_extract_workers)
+    _do_parallel_work(do_work, _3d_range_list, num_workers)
 
 
 def _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree, temp_dir):
+    if _TIMING:
+        _timing_set_role('extract')
     do_work = partial(extract_zero_shards_stage3, optim_files, param_shapes, dp_degree, temp_dir)
     _do_parallel_work(do_work, list(range(dp_degree)), args.num_extract_workers)
 
 
 def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
+    if _TIMING:
+        _timing_set_role('merge')
     zero_output_folder = os.path.join(args.output_folder, "zero")
     do_work = partial(merge_tp_slices, ds_checkpoint, zero_output_folder, temp_dir, ds_checkpoint.tp_degree)
     unmatched_patterns_lists = _do_parallel_work(do_work, list(slice_shapes.items()), args.num_merge_workers)
@@ -492,6 +732,8 @@ def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
 
 
 def _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir):
+    if _TIMING:
+        _timing_set_role('merge')
     zero_output_folder = os.path.join(args.output_folder, "zero")
     do_work = partial(merge_zero3_slices, dp_degree, zero_output_folder, temp_dir)
     _do_parallel_work(do_work, param_shapes.keys(), args.num_merge_workers)
@@ -510,7 +752,10 @@ def _parse_model_states_stage3(files):
 
 def _save_optimizer_state(args, ds_checkpoint):
     sharded_states = [BASE_OPTIMIZER_STATE, PARAM_SLICE_MAPPINGS, SINGLE_PARTITION_OF_FP32_GROUPS]
+    t0 = time.perf_counter_ns() if _TIMING else 0
     sd = ds_checkpoint.get_zero_checkpoint_state(pp_index=0, tp_index=0, dp_index=0)
+    if _TIMING:
+        _timing_shard_load(ds_checkpoint, (0, 0, 0), t0, time.perf_counter_ns(), 'phase=optstate')
 
     optim_sd = sd[OPTIMIZER_STATE_DICT]
     output_sd = {k: v for k, v in optim_sd.items() if k not in sharded_states}
@@ -524,14 +769,21 @@ def _save_optimizer_state(args, ds_checkpoint):
     # improves the recorded metadata; per-parameter state is name-addressed and
     # unaffected either way.
     for pp_index in range(1, ds_checkpoint.pp_degree):
+        t0 = time.perf_counter_ns() if _TIMING else 0
         stage_sd = ds_checkpoint.get_zero_checkpoint_state(pp_index=pp_index, tp_index=0, dp_index=0)
+        if _TIMING:
+            _timing_shard_load(ds_checkpoint, (pp_index, 0, 0), t0, time.perf_counter_ns(), 'phase=optstate')
         stage_groups = stage_sd[OPTIMIZER_STATE_DICT][BASE_OPTIMIZER_STATE][PARAM_GROUPS]
         if len(stage_groups) > len(param_groups):
             param_groups = stage_groups
     output_sd[PARAM_GROUPS] = param_groups
     zero_output_folder = os.path.join(args.output_folder, "zero")
     output_file_path = os.path.join(zero_output_folder, f"optimizer_state.pt")
+    t0 = time.perf_counter_ns() if _TIMING else 0
     _save_checkpoint(output_file_path, output_sd)
+    if _TIMING:
+        _timing_record('optstate_write', 'optimizer_state', '', '', '', output_file_path,
+                       _timing_getsize(output_file_path), t0, time.perf_counter_ns())
 
 
 def _save_optimizer_state_stage3(args, optim_files):
@@ -663,21 +915,33 @@ def main(args):
                   f"{moe_info.get('ep_size')} expert-parallel ranks")
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('startup', _TIMING_T0_NS, _TIMING_T0_ABS)
         print('*** 1. Extracting ZeRO fragments')
         _extract_zero_shard_files(args, ds_checkpoint, temp_dir)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('extract', t_ph, t_ph_abs)
 
         print('*** 2. Merging slices .....')
         _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('merge', t_ph, t_ph_abs)
 
         print('*** 3. Saving common optimizer states')
         _save_optimizer_state(args, ds_checkpoint)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('optstate', t_ph, t_ph_abs)
 
         if not args.keep_temp_folder:
             shutil.rmtree(temp_dir, ignore_errors=True)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('cleanup', t_ph, t_ph_abs)
 
         # Copy mp* files into output folder
         for f in glob.glob(os.path.join(args.input_folder, 'mp*')):
             shutil.copy2(f, args.output_folder)
+        if _TIMING:
+            _timing_phase_end('copy_mp', t_ph, t_ph_abs)
 
     else:
         model_files = _get_model_state_files(args.input_folder)
@@ -687,21 +951,33 @@ def main(args):
 
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('startup', _TIMING_T0_NS, _TIMING_T0_ABS)
         print('*** 1. Extracting ZeRO fragments')
         _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree, temp_dir)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('extract', t_ph, t_ph_abs)
 
         print('*** 2. Merging slices .....')
         _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('merge', t_ph, t_ph_abs)
 
         print('*** 3. Saving common optimizer states')
         _save_optimizer_state_stage3(args, optim_files)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('optstate', t_ph, t_ph_abs)
 
         if not args.keep_temp_folder:
             shutil.rmtree(temp_dir, ignore_errors=True)
+        if _TIMING:
+            t_ph, t_ph_abs = _timing_phase_end('cleanup', t_ph, t_ph_abs)
 
         # Copy *model_states files into output folder
         for f in glob.glob(os.path.join(args.input_folder, '*model_states.pt')):
             shutil.copy2(f, args.output_folder)
+        if _TIMING:
+            _timing_phase_end('copy_mp', t_ph, t_ph_abs)
 
     # Update latest to output folder
     checkpoint_root_folder, step_folder = os.path.split(args.output_folder)
@@ -709,6 +985,8 @@ def main(args):
     with open(latest_file, "w") as f:
         f.write(step_folder)
 
+    if _TIMING:
+        _timing_phases_report(args)
     print('*** Done!')
 
 

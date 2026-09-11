@@ -4,12 +4,13 @@
 # DeepSpeed Team
 
 import os
-import torch
+import time
 
 from deepspeed.utils import logger
 from deepspeed.utils.tensor_fragment import map_to_flat_opt_states
 from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank
 from deepspeed.checkpoint.utils import load_checkpoint_file
+from deepspeed.checkpoint.universal_checkpoint import universal_load_timing
 
 
 class DeepSpeedOptimizer(object):
@@ -50,11 +51,22 @@ class ZeROOptimizer(DeepSpeedOptimizer):
                                                      lp_groups_name: str,
                                                      checkpoint_dir: str,
                                                      param_name_aliases=None) -> None:
+        # Per-rank timing, enabled by UCP_LOAD_TIMING_DIR (see deepspeed.checkpoint.universal_checkpoint).
+        timing = universal_load_timing()
+        if timing:
+            timing.n_files = 0
+            timing.n_bytes = 0
+            t_bracket0 = time.perf_counter_ns()
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
         optim_state_path = os.path.join(checkpoint_dir, "optimizer_state.pt")
         assert os.path.isfile(
             optim_state_path), f'{optim_state_path} containing optimizer global state is missing! Cannot proceed.'
-        optim_sd = torch.load(optim_state_path)
+        if timing:
+            t_opt0 = time.perf_counter_ns()
+        optim_sd = load_checkpoint_file(optim_state_path)
+        if timing:
+            t_opt1 = time.perf_counter_ns()
+            timing.file_row('optstate', optim_state_path, t_opt0, t_opt1, t_opt1, key='optimizer_state')
 
         self._load_global_state(optim_sd)
 
@@ -95,9 +107,12 @@ class ZeROOptimizer(DeepSpeedOptimizer):
             lp_groups = getattr(self, lp_groups_name)
             for lp in lp_groups[i]:
                 if lp._hp_mapping is not None:
-                    #print(f"Loading {self.param_names[lp]} {tp_rank=} {tp_world_size=}")
-                    step = lp.load_hp_checkpoint_state(os.path.join(checkpoint_dir, self.param_names[lp]), tp_rank,
-                                                       tp_world_size)
+                    if timing:
+                        t_folder0 = time.perf_counter_ns()
+                    folder = self._hp_param_folder(checkpoint_dir, self.param_names[lp], param_name_aliases)
+                    if timing:
+                        timing.isdir_ns = time.perf_counter_ns() - t_folder0
+                    step = lp.load_hp_checkpoint_state(folder, tp_rank, tp_world_size)
                     for key in lp._hp_mapping.get_optim_state_keys():
                         opt_keys.add(key)
                     steps.append(step)
@@ -108,6 +123,8 @@ class ZeROOptimizer(DeepSpeedOptimizer):
                 self.optimizer.state[hp_param]['step'] = steps[0]
                 restored_step = steps[0]
 
+            if timing:
+                t_map0 = time.perf_counter_ns()
             map_to_flat_opt_states(hp_param, lp_groups[i], self.optimizer.state, opt_keys)
             if timing:
                 timing.row('group', key=str(i), count=len(steps), t0_ns=t_map0, t1_ns=time.perf_counter_ns())
@@ -135,7 +152,17 @@ class ZeROOptimizer(DeepSpeedOptimizer):
             for param_group in self.optimizer.param_groups:
                 param_group['step'] = restored_step
 
-            for key, value in loaded_param_group.items():
-                if key == 'params':
-                    continue
-                param_group[key] = value
+        if timing:
+            t_bracket1 = time.perf_counter_ns()
+            timing.row('bracket',
+                       path=checkpoint_dir,
+                       tp_rank=tp_rank,
+                       tp_world_size=tp_world_size,
+                       nbytes=timing.n_bytes,
+                       count=timing.n_files,
+                       t0_ns=t_bracket0,
+                       t1_ns=t_bracket1,
+                       wall_time=time.time())
+            logger.info(f'universal checkpoint load timing: rank {timing.rank} read {timing.n_files} files, '
+                        f'{timing.n_bytes} bytes from {checkpoint_dir} in {(t_bracket1 - t_bracket0) * 1e-9:.3f} s '
+                        f'(per-event csv: {timing.path})')

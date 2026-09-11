@@ -64,6 +64,16 @@ ORIGINAL_VOCAB_SIZE = 'original_vocab_size'
 
 # Parameter splitting/merging
 PARAM_SLICE_MAPPINGS = 'param_slice_mappings'
+
+#########################################
+# Expert parallelism (MoE)
+#########################################
+# How many experts the model has, as {'ep_size', 'num_local_experts',
+# 'expert_tensor_parallel'}, written once with the model state. Expert parameter names are
+# already globally unique in the checkpoint, but param_shapes is recorded by a single rank
+# and therefore lists only that rank's experts; ds_to_universal.py needs these counts to know
+# how many exist in total. It has no process groups of its own and cannot ask.
+MOE_UCP_INFO = 'moe_ucp_info'
 CAT_DIM = "cat_dim"
 # Following is a special case where a parameter effectively contains sub parameters.
 # As an example, consider Megatron-DeepSpeed GPT SWIGLU implementation (mlp.h_to_4h).

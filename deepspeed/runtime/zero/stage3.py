@@ -2678,7 +2678,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         load_from_fp32_weights=False,
                         checkpoint_folder=None,
                         load_serial=None,
-                        param_shapes=None):
+                        param_shapes=None,
+                        param_name_aliases=None):
         r"""Loading a ZeRO checkpoint
         Arguments:
             state_dict_list: List of all saved ZeRO checkpoints, one for each saved partition.
@@ -2709,7 +2710,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if checkpoint_folder:
             self._load_universal_checkpoint(checkpoint_folder, load_optimizer_states, load_from_fp32_weights,
-                                            param_shapes)
+                                            param_shapes, param_name_aliases)
         else:
             self._rigid_load_state_dict(state_dict_list[dist.get_rank(group=self.dp_process_group)],
                                         load_optimizer_states=load_optimizer_states)
@@ -2731,10 +2732,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 # self.persistent_parameters[0].all_gather(self.persistent_parameters) # this will be done in checkpoint_event_epilogue() so remove it to prevent double all_gather
 
     def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights,
-                                   param_shapes):
-        self.load_hp_checkpoint_state_from_checkpoint_dir_stage3(checkpoint_folder, param_shapes)
+                                   param_shapes, param_name_aliases=None):
+        self.load_hp_checkpoint_state_from_checkpoint_dir_stage3(checkpoint_folder, param_shapes,
+                                                                 param_name_aliases)
 
-    def load_hp_checkpoint_state_from_checkpoint_dir_stage3(self, checkpoint_dir, param_shapes):
+    def load_hp_checkpoint_state_from_checkpoint_dir_stage3(self, checkpoint_dir, param_shapes,
+                                                            param_name_aliases=None):
         """ Load optimizer and model states from the checkpoint directory. """
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
         optim_state_path = os.path.join(checkpoint_dir, "optimizer_state.pt")
@@ -2749,7 +2752,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         for key in key_list:
             key_tensor = torch.empty(0)
             for layer in param_shapes[0].keys():
-                key_layer_state_partition = self.load_hp_checkpoint_state(os.path.join(checkpoint_dir, layer), key)
+                folder = self._hp_param_folder(checkpoint_dir, layer, param_name_aliases)
+                key_layer_state_partition = self.load_hp_checkpoint_state(folder, key)
                 key_tensor = torch.cat((key_tensor, key_layer_state_partition))
             if key == "fp32":
                 self.fp32_partitioned_groups_flat[0].data.copy_(key_tensor)

@@ -2288,14 +2288,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         load_from_fp32_weights=False,
                         checkpoint_folder=None,
                         load_serial=None,
-                        param_shapes=None):
+                        param_shapes=None,
+                        param_name_aliases=None):
         if checkpoint_folder:
-            self._load_universal_checkpoint(checkpoint_folder, load_optimizer_states, load_from_fp32_weights)
+            self._load_universal_checkpoint(checkpoint_folder, load_optimizer_states, load_from_fp32_weights,
+                                            param_name_aliases)
         else:
             self._load_legacy_checkpoint(state_dict_list, load_optimizer_states, load_from_fp32_weights)
 
-    def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights):
-        self.load_hp_checkpoint_state_from_checkpoint_dir("bit16_groups", checkpoint_folder)
+    def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights,
+                                   param_name_aliases=None):
+        self.load_hp_checkpoint_state_from_checkpoint_dir("bit16_groups", checkpoint_folder,
+                                                          param_name_aliases)
 
     @property
     def param_groups(self):

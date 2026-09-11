@@ -25,6 +25,26 @@ CHECKPOINT_INFO_KEY = 'checkpoint_info'
 ITERATION_KEY = 'iteration'
 LAYER_FILE_PREFIX_PATTERN = r'layer_(\d+)-model_.*'
 
+
+def get_pipeline_layer_files(all_files):
+    """Select the pipeline-layer checkpoint files, i.e. those written by
+    PipelineModule.ckpt_layer_path():
+
+        layer_<idx:02d>[-<rank_repr>]-model_states.pt
+
+    Matching is done against LAYER_FILE_PREFIX_PATTERN -- the same format
+    _get_layer_keys() already requires -- rather than the bare LAYER_FILE_PREFIX.
+    DeepSpeed MoE also writes one file per (layer, expert):
+
+        layer_<L>_expert_<E>_mp_rank_<NN>_model_states.pt
+
+    which shares the 'layer_' prefix but is not a pipeline layer file. Selecting on
+    the prefix alone misclassifies a MoE checkpoint as pipeline-parallel and feeds
+    non-conforming names into _get_layer_keys().
+    """
+    return sorted(f for f in all_files if re.match(LAYER_FILE_PREFIX_PATTERN, os.path.basename(f)))
+
+
 SEQUENTIAL_LAYERS = [
     'input_layernorm.weight', 'input_layernorm.bias', 'self_attention.dense.bias', 'post_attention_layernorm.weight',
     'post_attention_layernorm.bias', 'mlp.dense_4h_to_h.bias', 'position_embeddings.weight'
@@ -44,14 +64,14 @@ class DeepSpeedCheckpoint(object):
         self.final_layer_norm_idx = final_layer_norm_idx
         self.dir = dir
 
-        pipeline_parallel = len(get_files_with_prefix(get_files(dir), LAYER_FILE_PREFIX)) > 0
+        pipeline_parallel = len(get_pipeline_layer_files(get_files(dir))) > 0
 
         self._validate_folder(dir, pipeline_parallel)
 
         self.zero_checkpoint = ZeROCheckpoint(dir)
 
         self.file_list = get_files(dir)
-        self.layer_files = get_files_with_prefix(self.file_list, LAYER_FILE_PREFIX)
+        self.layer_files = get_pipeline_layer_files(self.file_list)
         self.mp_rank_files = get_files_with_prefix(self.file_list, MODEL_FILE_PREFIX)
 
         self.layer_keys = self._get_layer_keys()
@@ -154,9 +174,17 @@ class DeepSpeedCheckpoint(object):
         return self.tp_to_embedding_map[tp_index]
 
     def _get_checkpoint_value(self, key):
+        # Scans every model-state file rather than only the first. Most keys are written by
+        # every rank, so the first file answers; but a key recorded only by pipeline stages
+        # with a particular kind of layer is absent from stage 0 whenever that stage does not
+        # have one, and reading stage 0 alone would report it missing.
         if not key in self.global_state:
-            sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'))
-            self.global_state[key] = sd.get(key, None)
+            value = None
+            for mp_rank_file in self.mp_rank_files:
+                value = load_checkpoint_file(mp_rank_file).get(key, None)
+                if value is not None:
+                    break
+            self.global_state[key] = value
 
         return self.global_state[key]
 

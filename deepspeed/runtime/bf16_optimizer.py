@@ -486,9 +486,11 @@ class BF16_Optimizer(ZeROOptimizer):
                         load_optimizer_states=True,
                         load_from_fp32_weights=False,
                         load_serial=None,
-                        param_shapes=None):
+                        param_shapes=None,
+                        param_name_aliases=None):
         if checkpoint_folder:
-            self._load_universal_checkpoint(checkpoint_folder, load_optimizer_states, load_from_fp32_weights)
+            self._load_universal_checkpoint(checkpoint_folder, load_optimizer_states, load_from_fp32_weights,
+                                            param_name_aliases)
         else:
             self._load_legacy_checkpoint(state_dict_list, load_optimizer_states, load_from_fp32_weights)
 
@@ -516,8 +518,10 @@ class BF16_Optimizer(ZeROOptimizer):
         if load_optimizer_states:
             self._link_all_hp_params()
 
-    def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights):
-        self.load_hp_checkpoint_state_from_checkpoint_dir("bf16_groups", checkpoint_folder)
+    def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights,
+                                   param_name_aliases=None):
+        self.load_hp_checkpoint_state_from_checkpoint_dir("bf16_groups", checkpoint_folder,
+                                                          param_name_aliases)
 
     def _load_global_state(self, sd):
         pass

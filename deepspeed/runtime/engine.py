@@ -97,7 +97,8 @@ from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer, UnblancedMOELayer
 from ..moe.moe_v2 import TopKGatev2, MOEv2Layer
 from ..moe.layer import MoE
-from ..moe.utils import is_moe_param, configure_moe_param_groups
+from ..checkpoint.constants import MOE_UCP_INFO
+from ..moe.utils import is_moe_param, configure_moe_param_groups, globalize_expert_param_names
 from ..git_version_info import version
 
 from deepspeed.profiling.flops_profiler.profiler import FlopsProfiler
@@ -178,6 +179,17 @@ class EngineTimers(object):
                 FORWARD_GLOBAL_TIMER, BACKWARD_GLOBAL_TIMER, BACKWARD_INNER_GLOBAL_TIMER, BACKWARD_REDUCE_GLOBAL_TIMER,
                 STEP_GLOBAL_TIMER
             ]
+
+
+# NEGATIVE RESULT (2026-08-15, adversarial review): do NOT switch expert checkpoint
+# file ids from the per-stage running counter to the global spec index. With the
+# checkpoint mp_rank carrying the pipeline stage (see _checkpoint_mp_rank), the
+# counter is already collision-free on every path, and even-partition pipe MoE
+# checkpoints round-trip on the unmodified branch using counter ids -- a rename
+# breaks old->new AND new->old resume (FileNotFoundError on the first expert file)
+# while buying nothing: universal loads never read expert files, and non-universal
+# cross-PP resharding is impossible regardless (mp_rank changes with the stage).
+
 
 
 class DeepSpeedEngine(Module):
@@ -271,6 +283,46 @@ class DeepSpeedEngine(Module):
 
         # needed for zero_to_fp32 weights reconstruction to remap nameless data to state_dict
         self.param_names = {param: name for name, param in model.named_parameters()}
+
+        # This mapping is the only place a parameter's checkpoint name is decided. Everything
+        # universal checkpointing addresses by name flows from it: ZeRO's param_slice_mappings
+        # (what the converter extracts), _get_zero_param_shapes (what it merges), and the
+        # folder the universal loader reads back. Expert parallelism makes named_parameters()
+        # rank-local, so the names are made globally unique here, once, rather than in each of
+        # those three places -- which is what keeps expert handling out of ZeRO, out of
+        # ds_to_universal.py and out of the universal load path entirely.
+        #
+        # Runs only for a model that actually has expert-parallel layers; the mapping of every
+        # other model is untouched.
+        #
+        # An expert implementation that stacks its local experts into one tensor has no
+        # per-expert name to globalise. That is reported, not raised: it makes the checkpoint
+        # unconvertible, but it must not stop a job that is only training. The refusal happens
+        # in ds_to_universal.py, where a user can act on it -- see _get_moe_ucp_info.
+        self._non_globalized_expert_names = []
+        if self.has_moe_layers:
+            self.param_names, self._non_globalized_expert_names = \
+                globalize_expert_param_names(model, self.param_names)
+            if self._non_globalized_expert_names:
+                log_dist(
+                    f'{len(self._non_globalized_expert_names)} expert parameters keep '
+                    f'expert-parallel-rank-local names because their expert module stacks all '
+                    f'local experts into one tensor (e.g. {self._non_globalized_expert_names[0]}). '
+                    f'Training is unaffected; checkpoints written by this job cannot be converted '
+                    f'to universal format.',
+                    ranks=[0])
+
+        # Alternative names under which this model's parameters may already exist in a
+        # universal checkpoint. Optional, model-declared, and consulted ONLY when the atom
+        # directory for a parameter's own name is absent (see
+        # ZeROOptimizer._hp_param_folder). The same network built as a different module
+        # class -- e.g. pipeline vs non-pipeline -- names its parameters differently while
+        # the tensors correspond one-to-one; this lets such a checkpoint be read without
+        # rewriting anything on disk. Declared here because this is where a parameter's
+        # checkpoint name is decided.
+        self.param_name_aliases = {}
+        if hasattr(model, 'universal_checkpoint_name_aliases'):
+            self.param_name_aliases = model.universal_checkpoint_name_aliases(self.param_names) or {}
 
         self._get_model_parameters()
 
@@ -1209,6 +1261,9 @@ class DeepSpeedEngine(Module):
         self.seq_data_parallel_group = groups._get_sequence_data_parallel_group()
         self.seq_dp_world_size = groups._get_sequence_data_parallel_world_size()
         self.mp_world_size = groups._get_model_parallel_world_size()
+        # filename-coordinate width (see _checkpoint_mp_world_size); == mp_world_size
+        # everywhere except a pipeline grid with a custom partition
+        self.ckpt_mp_world_size = self._checkpoint_mp_world_size(self.mpu, self.mp_world_size)
         self.expert_parallel_group = groups._get_expert_parallel_group_dict()
         self.expert_data_parallel_group = groups._get_expert_data_parallel_group_dict()
         self.sequence_parallel_size = groups._get_sequence_parallel_world_size()
@@ -2737,8 +2792,38 @@ class DeepSpeedEngine(Module):
         )
         return zero_ckpt_name
 
+    @staticmethod
+    def _checkpoint_mp_rank(mpu):
+        """Model-parallel coordinate for checkpoint FILENAMES.
+
+        Prefers the pipeline grid's stage-spanning checkpoint accessor
+        (pipe_rank * tp_size + tp_rank). The grid's runtime
+        get_model_parallel_rank may be collapsed to the tensor slice under a
+        custom (uneven) pipeline partition -- a load-bearing runtime behavior --
+        but mp_rank_<n> is the only per-stage discriminator in the flat
+        checkpoint layout, so filenames must keep the stage or every stage
+        overwrites the same files. Non-pipeline mpus (Megatron's module) have no
+        such accessor; their model-parallel rank is already the correct
+        filename coordinate.
+        """
+        if mpu is None:
+            return 0
+        fn = getattr(mpu, 'get_checkpoint_model_parallel_rank', None)
+        return fn() if fn is not None else mpu.get_model_parallel_rank()
+
+    @staticmethod
+    def _checkpoint_mp_world_size(mpu, default):
+        """Filename-coordinate counterpart of _checkpoint_mp_rank: the number of
+        mp_rank_* files a checkpoint has. Must change together with the rank
+        (the load path asserts len(files) == world size)."""
+        if mpu is not None:
+            fn = getattr(mpu, 'get_checkpoint_model_parallel_world_size', None)
+            if fn is not None:
+                return fn()
+        return default
+
     def _get_zero_ckpt_name(self, checkpoints_path, tag):
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
         pp_rank = dist.get_rank(group=self.optimizer.dp_process_group)
         bf16_mode = self.bfloat16_enabled()
         return self._get_rank_zero_ckpt_name(checkpoints_path, tag, mp_rank, pp_rank, bf16_mode)
@@ -2747,7 +2832,7 @@ class DeepSpeedEngine(Module):
         if mp_placeholder is not None:
             mp_rank_str = mp_placeholder
         else:
-            mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+            mp_rank = self._checkpoint_mp_rank(self.mpu)
             mp_rank_str = f"{mp_rank:02d}"
 
         if self.zero_optimization_partition_weights():
@@ -2769,14 +2854,14 @@ class DeepSpeedEngine(Module):
         return ckpt_name
 
     def _get_optimizer_ckpt_name(self, checkpoints_path, tag, expp_rank):
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
         ckpt_name = os.path.join(checkpoints_path, str(tag),
                                  f'expp_rank_{expp_rank}_mp_rank_{mp_rank:02d}_optim_states.pt')
         return ckpt_name
 
     @staticmethod
     def _get_expert_ckpt_name(checkpoints_path, layer_id, expert_id, tag, mpu=None):
-        mp_rank = 0 if mpu is None else mpu.get_model_parallel_rank()
+        mp_rank = DeepSpeedEngine._checkpoint_mp_rank(mpu)
         if layer_id <= -1:
             # Used to support old checkpoint loading
             ckpt_name = os.path.join(checkpoints_path, '' if tag is None else str(tag),
@@ -2902,8 +2987,16 @@ class DeepSpeedEngine(Module):
 
         is_pipe_parallel = isinstance(self.module, PipelineModule)
 
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
-        load_path, checkpoint, _ = sd_loader.load(self.mp_world_size, mp_rank, is_pipe_parallel=is_pipe_parallel)
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
+        # Under a universal load the mp_rank payload is metadata only (args, iteration,
+        # RNG): load_module_state_dict is skipped below and the weights come from the fp32
+        # optimizer state. Merging or splitting mp_rank shards is therefore meaningless --
+        # and for a checkpoint written by a PP>1 pipeline run it is fatal, because those
+        # files hold disjoint per-stage key sets (or module=None) that
+        # state_dict_factory.merge_state_dict cannot combine. Read a single file, exactly
+        # as the pipeline branch already does.
+        single_file = is_pipe_parallel or self.load_universal_checkpoint()
+        load_path, checkpoint, _ = sd_loader.load(self.ckpt_mp_world_size, mp_rank, is_pipe_parallel=single_file)
 
         if checkpoint is None:
             return None, None
@@ -2917,7 +3010,12 @@ class DeepSpeedEngine(Module):
             # Pipeline parallelism uses this to load its own checkpoint files.
             self._curr_ckpt_path = os.path.join(load_dir, tag)
 
-        if self.has_moe_layers:
+        # A universal checkpoint holds no per-expert weight files: load_module_state_dict is
+        # skipped below, and the bf16 weights are regenerated from the fp32 optimizer state
+        # by update_lp_params() once loading completes. Reading layer_<L>_expert_<E>_*.pt
+        # here would be wasted IO even if they were present, and they are not -- the
+        # converter does not copy them.
+        if self.has_moe_layers and not self.load_universal_checkpoint():
             # print(checkpoint.keys())
             old_moe_load = False
             if not isinstance(checkpoint['num_experts'], list):
@@ -3054,7 +3152,8 @@ class DeepSpeedEngine(Module):
                                        load_from_fp32_weights=self.zero_load_from_fp32_weights(),
                                        checkpoint_folder=checkpoint_folder,
                                        load_serial=load_serial,
-                                       param_shapes=param_shapes)
+                                       param_shapes=param_shapes,
+                                       param_name_aliases=self.param_name_aliases)
 
         if self.load_universal_checkpoint():
             logger.info(f'loaded universal zero checkpoints from {checkpoint_folder} for rank {self.global_rank}')
@@ -3075,7 +3174,7 @@ class DeepSpeedEngine(Module):
         return zero_ckpt_names
 
     def _get_all_zero_checkpoint_names(self, load_dir, tag, bf16_mode):
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
         zero_ckpt_names = self._get_mp_rank_zero_checkpoint_names(load_dir=load_dir,
                                                                   tag=tag,
                                                                   mp_rank=mp_rank,
@@ -3299,6 +3398,20 @@ class DeepSpeedEngine(Module):
 
         self._curr_ckpt_path = os.path.join(save_dir, tag)
 
+        if isinstance(self.module, PipelineModule):
+            # The MoE save path bypasses PipelineEngine.module_state_dict (it needs
+            # the dict returned, so it calls the base class), which means the
+            # per-layer pipeline files were never written -- and without
+            # layer_NN-model_XX files, checkpoint topology detection
+            # (deepspeed.checkpoint.reshape_3d_utils.get_model_3d_descriptor)
+            # misreads a PP=P checkpoint as TP=P. Write them here, ADDITIVELY:
+            # the mp_rank payload above is unchanged and remains what the
+            # non-universal MoE resume loads. All ranks must call -- the module
+            # spreads layer writes across data-parallel ranks internally.
+            self.module.save_state_dict(self._curr_ckpt_path,
+                                        checkpoint_engine=self.checkpoint_engine,
+                                        exclude_frozen_params=exclude_frozen_parameters)
+
         largest_group_name = groups._get_max_expert_size_name()
         expp_rank = groups._get_expert_parallel_rank(largest_group_name)
         exp_dp_rank = groups._get_expert_data_parallel_rank(largest_group_name)
@@ -3346,13 +3459,63 @@ class DeepSpeedEngine(Module):
                 'dp_world_size':
                 self.dp_world_size,
                 'mp_world_size':
-                self.mp_world_size,
+                self.ckpt_mp_world_size,
                 'num_experts':
                 self.num_experts
             }
+            # Whether experts are also tensor-parallel. A reader needs this to know whether
+            # an expert's saved state is a full tensor or one tensor-parallel slice of one.
+            state[MOE_UCP_INFO] = self._get_moe_ucp_info()
+
+            # The MoE save path builds its own state dict, so it must record the same
+            # reconstruction metadata _save_checkpoint() does. param_shapes in particular
+            # is what lets a reader map the optimizer's flat buffers back to parameters;
+            # without it a checkpoint can be resumed at the same topology but can never be
+            # converted to a universal checkpoint, and it cannot be added afterwards.
+            zero_optimizer_state = self.zero_optimization() or self.bfloat16_enabled()
+            state.update(
+                dict(buffer_names=self._get_buffer_names(),
+                     param_shapes=self._get_zero_param_shapes()
+                     if self.optimizer and zero_optimizer_state else None,
+                     shared_params=self._get_shared_params()
+                     if self.optimizer and zero_optimizer_state else None,
+                     ds_version=version))
             state.update(client_state)
             logger.info(f'Saving model checkpoint: {save_path}')
             self.checkpoint_engine.save(state, save_path)
+
+    def _get_moe_ucp_info(self):
+        """MoE properties that are identical on every rank, for universal checkpointing.
+
+        param_shapes is written by one rank, so it names only that rank's local experts.
+        A reader needs ep_size and num_local_experts to know how many experts exist in
+        total and therefore how many parameter entries to materialise, and
+        expert_names_globalized to know whether those names are addresses at all.
+        """
+        info = {
+            'expert_tensor_parallel': self._expert_tensor_parallel_enabled(),
+            # False means at least one expert parameter is still named rank-locally, so its
+            # atom would be written once per expert-parallel rank to the same directory.
+            'expert_names_globalized': not self._non_globalized_expert_names,
+        }
+        for _, module in self.module.named_modules():
+            if isinstance(module, MoE):
+                group_name = module.expert_group_name
+                info['num_local_experts'] = module.num_local_experts
+                info['ep_size'] = groups._get_expert_parallel_world_size(group_name)
+                break
+        return info
+
+    def _expert_tensor_parallel_enabled(self):
+        """True if any MoE layer shards its experts across the tensor-parallel group.
+
+        Read from the live modules rather than from args, because MoE is configured
+        per layer and the flag is not otherwise recorded in the checkpoint.
+        """
+        for _, module in self.module.named_modules():
+            if isinstance(module, MoE):
+                return bool(getattr(module, 'enable_expert_tensor_parallelism', False))
+        return False
 
     def _create_checkpoint_file(self, save_dir, tag, zero_checkpoint):
         name_function = (self._get_zero_ckpt_name if zero_checkpoint else self._get_ckpt_name)
@@ -3411,7 +3574,7 @@ class DeepSpeedEngine(Module):
                      global_steps=self.global_steps,
                      global_samples=self.global_samples,
                      dp_world_size=self.seq_dp_world_size,
-                     mp_world_size=self.mp_world_size,
+                     mp_world_size=self.ckpt_mp_world_size,
                      ds_config=self.config,
                      ds_version=version)
         state.update(client_state)

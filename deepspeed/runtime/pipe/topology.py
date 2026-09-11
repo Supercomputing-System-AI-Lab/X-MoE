@@ -486,3 +486,20 @@ class PipelineParallelGrid:
 
     def get_slice_parallel_group(self):
         return self.slice_proc_group
+
+    # Checkpoint-naming coordinates. The get_model_parallel_* getters above are
+    # collapsed to the slice under a custom (uneven) pipeline partition -- that
+    # collapse is load-bearing for the runtime (it keeps ZeRO's per-param-group
+    # model-parallel reductions from deadlocking when stages hold different group
+    # counts) but it must never leak into checkpoint FILENAMES: mp_rank_<n> is the
+    # only per-stage discriminator DeepSpeed's flat checkpoint layout has, and a
+    # collapsed rank makes every stage overwrite the same files. These accessors
+    # always return the stage-spanning coordinates (pipe_rank * slice_ws +
+    # slice_rank), matching the upstream layout that
+    # deepspeed.checkpoint's topology detection expects. Consumed only by the
+    # checkpoint path in runtime/engine.py; the runtime getters are untouched.
+    def get_checkpoint_model_parallel_rank(self):
+        return self.ds_model_rank
+
+    def get_checkpoint_model_parallel_world_size(self):
+        return self.ds_model_world_size

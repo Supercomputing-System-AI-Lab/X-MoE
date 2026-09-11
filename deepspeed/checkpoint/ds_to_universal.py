@@ -36,6 +36,7 @@ from deepspeed.checkpoint import (
     PARAM_GROUPS,
     PARAM_SLICE_MAPPINGS,
     MOE_UCP_INFO,
+    BUFFER_NAMES,     # [X-MoE, 2026-09-11] the persistent buffers become atoms (extract_buffers)
     GROUP_PADDINGS,   # [X-MoE, 2026-09-06] used by index_zero_shard (--fragments-inplace)
     PARAM_SHAPES,
     PARAM,
@@ -1271,6 +1272,38 @@ def _parse_model_states_stage3(files):
     return load_checkpoint_file(files[0])[PARAM_SHAPES]
 
 
+def extract_buffers(args, ds_checkpoint):
+    """[X-MoE, 2026-09-11] The model's persistent buffers (BUFFER_NAMES in the mp_rank files, engine._get_buffer_names; today the
+    DeepSeek-V3 router's balancing bias) become atoms zero/<name>/buffer.pt, so a universal load, which skips the module state,
+    can restore them (engine._load_buffers_from_universal). The value is tensor-parallel rank 0's, asserted equal on every
+    tensor-parallel rank (a buffer is replicated). A pipeline checkpoint keeps a buffer in its layer file
+    (layer_<idx>-model_<tp>-model_states.pt, under the name without the '<idx>.' prefix); a non-pipeline one in the module state
+    of the mp_rank file. Returns the number of buffers written."""
+    names = []
+    for mp_rank_file in ds_checkpoint.mp_rank_files:
+        for name in (load_checkpoint_file(mp_rank_file).get(BUFFER_NAMES) or []):
+            if name not in names:
+                names.append(name)
+    if not names:
+        return 0
+    pipeline = len(ds_checkpoint.layer_files) > 0
+    for name in names:
+        values = []
+        for tp_index in range(ds_checkpoint.tp_degree):
+            if pipeline:
+                m = re.match(r'(\d+)\.(.+)', name)
+                assert m, f'pipeline buffer name without its layer index: {name}'
+                path = os.path.join(ds_checkpoint.dir, f'layer_{int(m.group(1)):02d}-model_{tp_index:02d}-model_states.pt')
+                values.append(load_checkpoint_file(path)[m.group(2)])
+            else:
+                values.append(load_checkpoint_file(ds_checkpoint.mp_rank_files[tp_index])['module'][name])
+        for other in values[1:]:
+            assert torch.equal(values[0], other), \
+                f'buffer {name} differs between tensor-parallel ranks; a buffer is replicated by construction'
+        _save_checkpoint(os.path.join(args.output_folder, 'zero', name, 'buffer.pt'), {'buffer': values[0].cpu()})
+    return len(names)
+
+
 def _save_optimizer_state(args, ds_checkpoint):
     if getattr(args, 'optstate_from_pickle', False) and _save_optimizer_state_from_pickle(args, ds_checkpoint):
         return
@@ -1449,6 +1482,10 @@ def main(args):
         _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir)
         if _TIMING:
             t_ph, t_ph_abs = _timing_phase_end('merge', t_ph, t_ph_abs)
+
+        n_buffers = extract_buffers(args, ds_checkpoint)   # [X-MoE, 2026-09-11] the persistent buffers as atoms
+        if n_buffers:
+            print(f'*** 2b. {n_buffers} persistent buffer(s) written as atoms (zero/<name>/buffer.pt)')
 
         print('*** 3. Saving common optimizer states')
         _save_optimizer_state(args, ds_checkpoint)

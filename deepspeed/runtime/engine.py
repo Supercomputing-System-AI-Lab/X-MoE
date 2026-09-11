@@ -3352,9 +3352,35 @@ class DeepSpeedEngine(Module):
 
         if self.load_universal_checkpoint():
             logger.info(f'loaded universal zero checkpoints from {checkpoint_folder} for rank {self.global_rank}')
+            self._load_buffers_from_universal(checkpoint_folder)   # [X-MoE, 2026-09-11] the persistent buffers
         else:
             logger.info(f"loading {len(zero_sd_list)} zero partition checkpoints for rank {self.global_rank}")
         return True
+
+    def _load_buffers_from_universal(self, checkpoint_folder):
+        """[X-MoE, 2026-09-11] A universal load skips load_module_state_dict (the weights come from the fp32 atoms), so the
+        model's persistent buffers would keep their initial values: the DeepSeek-V3 router's balancing bias would restart its
+        walk from zero after every layout change. Each is restored from its atom zero/<name>/buffer.pt, written by
+        ds_to_universal.extract_buffers from the source checkpoint. A persistent buffer without an atom is refused: the
+        checkpoint was converted by a converter that wrote none and must be reconverted."""
+        names = self._get_buffer_names()
+        if not names:
+            return
+        zero_dir = os.path.join(checkpoint_folder, 'zero')
+        missing = [n for n in names if not os.path.isfile(os.path.join(zero_dir, n, 'buffer.pt'))]
+        if missing:
+            raise RuntimeError(f'universal checkpoint {checkpoint_folder} has no buffer atom for {len(missing)} of the '
+                               f'{len(names)} persistent buffers of this model (e.g. zero/{missing[0]}/buffer.pt): it was '
+                               f'converted before buffers became atoms; reconvert it with the current ds_to_universal')
+        buffers = dict(self.module.named_buffers())
+        for name in names:
+            value = self.checkpoint_engine.load(os.path.join(zero_dir, name, 'buffer.pt'), map_location='cpu')['buffer']
+            buf = buffers[name]
+            assert tuple(value.shape) == tuple(buf.shape), \
+                f'buffer {name}: the atom has shape {tuple(value.shape)}, the model {tuple(buf.shape)}'
+            with torch.no_grad():
+                buf.copy_(value.to(buf.dtype))
+        log_dist(f'[universal] restored {len(names)} persistent buffer(s) from {zero_dir} (e.g. {names[0]})', ranks=[0])
 
     def _get_mp_rank_zero_checkpoint_names(self, load_dir, tag, mp_rank, dp_world_size, bf16_mode):
         zero_ckpt_names = []

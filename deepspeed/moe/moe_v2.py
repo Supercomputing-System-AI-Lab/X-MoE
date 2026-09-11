@@ -56,15 +56,41 @@ def topkgating_unbalanced(
     ep_group: Union[torch.distributed.ProcessGroup, None] = None,
     drop_policy: str = "probs",
     use_pft: bool = False,
-    softmax_before_topk: bool = False
+    softmax_before_topk: bool = False,
+    score_function: str = "softmax",
+    expert_bias: Union[Tensor, None] = None,
+    n_group: int = 1,
+    topk_group: int = 1,
+    norm_topk_prob: bool = False,
+    routed_scaling_factor: float = 1.0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Implements TopKGating on logits."""
+    """Implements TopKGating on logits.
+
+    score_function "sigmoid" is the DeepSeek-V3 router (the released DeepseekV3TopkRouter): the affinity is the sigmoid of
+    the logit; the choice adds the balancing bias (expert_bias, no gradient) and keeps the topk_group best of n_group expert
+    groups (a group scores by the sum of its two best affinities); the weights are the unbiased affinities of the chosen
+    experts, normalised to sum 1 when norm_topk_prob, times routed_scaling_factor. The default keeps the gate as it was.
+    """
 
     # everything is in fp32 in this function
     # get topk gates
     _, n_experts = logits.shape
 
-    if softmax_before_topk:
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits)
+        with torch.no_grad():
+            choice = scores + expert_bias.unsqueeze(0).to(scores.dtype) if expert_bias is not None else scores
+            group_scores = choice.view(-1, n_group, n_experts // n_group).topk(2, dim=-1)[0].sum(dim=-1)
+            group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+            score_mask = group_mask.unsqueeze(-1).expand(-1, n_group, n_experts // n_group).reshape(-1, n_experts)
+            choice = choice.masked_fill(~score_mask.bool(), 0.0)
+            top_idx = torch.topk(choice, k=k, dim=1, sorted=False)[1]
+        top_gate = scores.gather(1, top_idx)
+        if norm_topk_prob:
+            top_gate = top_gate / (top_gate.sum(dim=-1, keepdim=True) + 1e-20)
+        top_gate = top_gate * routed_scaling_factor
+    elif softmax_before_topk:
         scores = F.softmax(logits, dim=1)
         top_gate, top_idx = torch.topk(scores, k=k, dim=1) # shape: (n_tokens, n_experts)
     else:
@@ -120,10 +146,28 @@ class TopKGatev2(Module):
                  ep_group: Union[torch.distributed.ProcessGroup, None] = None,
                  top2_2nd_expert_sampling: bool = True,
                  softmax_before_topk: bool = False,
+                 score_function: str = "softmax",
+                 bias_update_speed: float = 0.0,
+                 n_group: int = 1,
+                 topk_group: int = 1,
+                 norm_topk_prob: bool = False,
+                 routed_scaling_factor: float = 1.0,
                  ) -> None:
         super().__init__()
 
         self.wg = torch.nn.Linear(model_dim, num_experts, bias=False)
+        # DeepSeek-V3 router fields (defaults = the gate as it was). With a bias update speed > 0 the gate carries the
+        # auxiliary-loss-free balancing bias (a persistent fp32 buffer, no gradient) and an accumulator of the tokens each
+        # expert received since the last optimizer step; the engine moves the bias after every step (_update_moe_router_bias).
+        self.score_function = score_function
+        self.bias_update_speed = float(bias_update_speed)
+        self.n_group = int(n_group)
+        self.topk_group = int(topk_group)
+        self.norm_topk_prob = bool(norm_topk_prob)
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        if self.bias_update_speed > 0.0:
+            self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32))
+            self.register_buffer("load_acc", torch.zeros(num_experts, dtype=torch.float32), persistent=False)
         # False (default) -> expert_weights are raw logits (X-MoE behavior).
         # True -> top-k over softmax probs, so expert_weights are probabilities, matching
         # HF DeepSeek's MoEGate. Needed to load HF MoE checkpoints.
@@ -161,7 +205,16 @@ class TopKGatev2(Module):
         gate_output = topkgating_unbalanced(logits, self.k,
                                 self.capacity_factor if self.training else self.eval_capacity_factor,
                                 self.min_capacity, self.drop_tokens, self.ep_group, use_pft=use_pft,
-                                softmax_before_topk=self.softmax_before_topk)
+                                softmax_before_topk=self.softmax_before_topk,
+                                score_function=self.score_function,
+                                expert_bias=getattr(self, "expert_bias", None),
+                                n_group=self.n_group, topk_group=self.topk_group,
+                                norm_topk_prob=self.norm_topk_prob,
+                                routed_scaling_factor=self.routed_scaling_factor)
+        if self.bias_update_speed > 0.0 and self.training:
+            # the tokens each expert received in this micro-batch (the 6th return, tokens_per_expert), summed until the step
+            with torch.no_grad():
+                self.load_acc += gate_output[5].to(self.load_acc.dtype)
 
         if self.wall_clock_breakdown:
             self.timers(TOPK_GATE_TIMER).stop()

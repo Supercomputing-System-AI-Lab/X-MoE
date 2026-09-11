@@ -83,6 +83,14 @@ class MoE(nn.Module):
                  # IMPLEMENTING SHARED EXPERT -- Added: pre-built wider dense MLP for the
                  # shared expert (built in transformer.py). None => no shared expert.
                  shared_expert: Optional[nn.Module] = None,
+                 # DeepSeek-V3 router (blueprint CS3); the defaults keep the gate as it was.
+                 scoring_func: Optional[str] = None,
+                 topk_method: Optional[str] = None,
+                 moe_router_bias_update_speed: float = 0.0,
+                 n_group: int = 1,
+                 topk_group: int = 1,
+                 norm_topk_prob: bool = False,
+                 routed_scaling_factor: float = 1.0,
                  ) -> None:
 
         super(MoE, self).__init__()
@@ -149,8 +157,16 @@ class MoE(nn.Module):
         elif use_uneven_all2all:
             # Passed only here: TopKGateRBD/TopKGate do not take this kwarg, and this is
             # the path X-MOE actually uses (--use-uneven-all-to-all).
-            gate = TopKGatev2(**gate_params, softmax_before_topk=softmax_before_topk)
+            v3_router = {}
+            if scoring_func is not None or topk_method is not None:
+                v3_router = dict(score_function=("sigmoid" if scoring_func == "sigmoid" else "softmax"),
+                                 bias_update_speed=(moe_router_bias_update_speed if topk_method == "noaux_tc" else 0.0),
+                                 n_group=n_group, topk_group=topk_group, norm_topk_prob=norm_topk_prob,
+                                 routed_scaling_factor=routed_scaling_factor)
+            gate = TopKGatev2(**gate_params, softmax_before_topk=softmax_before_topk, **v3_router)
         else:
+            assert scoring_func is None and topk_method is None, \
+                "the DeepSeek-V3 router lives in TopKGatev2 (--use-uneven-all-to-all); this gate does not take it"
             gate = TopKGate(**gate_params, use_uneven_all2all=use_uneven_all2all)
 
         moe_layer_params = {

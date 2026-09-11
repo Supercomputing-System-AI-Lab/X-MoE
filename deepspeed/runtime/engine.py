@@ -2365,6 +2365,31 @@ class DeepSpeedEngine(Module):
     def clip_fp32_gradients(self):
         clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(), mpu=self.mpu)
 
+    def _update_moe_router_bias(self):
+        """DeepSeek-V3's auxiliary-loss-free balancing (the report's rule): after every optimizer step, each gate that carries
+        an expert_bias moves it by +speed for the experts that received fewer tokens than the mean over the step and -speed
+        for the others; the loads are the gate's accumulator summed over the data-parallel group, then cleared. No gradient,
+        no loss term; the bias enters the choice of experts only, never their weights."""
+        gates = [m for m in self.module.modules()
+                 if getattr(m, 'bias_update_speed', 0.0) > 0.0 and hasattr(m, 'expert_bias') and hasattr(m, 'load_acc')]
+        if not gates:
+            return
+        dp_group = groups._get_data_parallel_group()
+        if not getattr(self, '_moe_router_bias_announced', False):
+            self._moe_router_bias_announced = True
+            if self.global_rank == 0:
+                logger.info(f'[deepseek_v3] router bias step: {len(gates)} gates on this stage, speed {gates[0].bias_update_speed}, '
+                            f'loads summed over {dist.get_world_size(group=dp_group) if dp_group is not None else 1} data-parallel ranks')
+        with torch.no_grad():
+            for g in gates:
+                load = g.load_acc.clone()
+                if dp_group is not None and dist.get_world_size(group=dp_group) > 1:
+                    dist.all_reduce(load, group=dp_group)
+                total = load.sum()
+                if total > 0:
+                    g.expert_bias.add_(g.bias_update_speed * torch.sign(load.mean() - load))
+                g.load_acc.zero_()
+
     def _take_model_step(self, lr_kwargs, block_eigenvalue={}):
         if self.gradient_clipping() > 0.0:
             if not (self.fp16_enabled() or self.bfloat16_enabled() or self.amp_enabled() or self.zero_optimization()):
@@ -2375,6 +2400,7 @@ class DeepSpeedEngine(Module):
                 master_params = amp.master_params(self.optimizer)
                 clip_grad_norm_(parameters=master_params, max_norm=self.gradient_clipping(), mpu=self.mpu)
         self.optimizer.step()
+        self._update_moe_router_bias()
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm

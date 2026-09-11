@@ -1284,7 +1284,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             if hasattr(p, PIPE_REPLICATED) and p.ds_pipe_replicated:
                 continue
 
-            if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
+            if is_model_parallel_parameter(p) or is_moe_param(p) or (self.model_parallel_rank == 0):   # experts count on every rank (see get_grad_norm_direct)
                 param_id = self.get_param_id(p)
                 # as some model have trainable parameters but skipped in training,
                 # their backward hooks in self.create_reduce_and_remove_grad_hooks() will not run,
@@ -1686,7 +1686,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 # Pipeline parallelism may replicate parameters. Avoid multi-counting.
                 if hasattr(p, PIPE_REPLICATED) and p.ds_pipe_replicated:
                     continue
-                if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
+                # An expert parameter lives once per expert-parallel group, and the expert-parallel groups span the tensor-parallel
+                # ranks (each TP rank holds different experts), so it counts on every rank like a sliced parameter; the
+                # deep-copied expert weights carry no tensor_model_parallel attribute and were counted on TP rank 0 only, which
+                # dropped the experts of the other TP ranks from the norm (TP 2: 2.433 reported vs 2.476 true, 2026-09-11) and
+                # made the clip coefficient depend on the layout. The BF16_Optimizer's rule (get_grads_for_norm) already counts them.
+                if is_model_parallel_parameter(p) or is_moe_param(p) or (self.model_parallel_rank == 0):
                     all_norms.append(
                         torch.norm(g.data.double().detach(), norm_type).to(get_accelerator().current_device_name()))
             if len(all_norms) > 0:

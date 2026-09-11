@@ -130,6 +130,12 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_folder', type=str, required=True, help='Input DeepSpeed Checkpoint folder')
     parser.add_argument('--output_folder', type=str, required=True, help='Output DeepSpeed checkpoint folder')
+    parser.add_argument(
+        '--fragment-container',
+        action='store_true',
+        help='[X-MoE, 2026-09-05] Extract phase writes ONE raw container per ZeRO shard plus an index instead of '
+        'one file per (parameter, state, shard); the merge reads fragments by offset. Same atoms, '
+        'far fewer files (19k-95k fewer creates and reads for the 10B on Frontier Lustre). Stage 1/2 only.')
     parser.add_argument('--num_extract_workers',
                         default=4,
                         type=int,
@@ -534,6 +540,161 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
     return slices
 
 
+# ----------------------------------------------------------------------------------------------
+# [X-MoE, 2026-09-05] Fragment containers (--fragment-container).
+#
+# Darshan on Frontier showed the conversion of a 10B checkpoint spends its extract phase creating
+# ~19k (DP8) to ~95k (DP32) small fragment files -- one per (parameter, state, shard), median
+# 10 KB -- and its merge phase reading them back, while the bytes moved take a fraction of that
+# time (ucp_io campaign, findings F8/F11/F12). Here each extract worker appends every fragment of
+# its shard to ONE raw file (tmp/shard_ppP_tpT_dpD.bin) and records (offset, numel, dtype) per
+# (parameter, out_tp, state) in tmp/shard_ppP_tpT_dpD.idx. The merge reads a parameter's DP
+# fragments by offset from the containers through cached file handles. The merged atoms are
+# produced by the same code path as before, so the universal checkpoint is unchanged.
+# ----------------------------------------------------------------------------------------------
+_CONTAINER_INDEX = None       # {(name, out_tp, state): {dp: (container_path, offset, numel, dtype_str)} | value}
+_CONTAINER_HANDLES = {}       # per process: container_path -> open file
+
+
+def _container_paths(temp_dir, pp_index, tp_index, dp_index):
+    stem = os.path.join(temp_dir, f"shard_pp{pp_index}_tp{tp_index}_dp{dp_index}")
+    return stem + '.bin', stem + '.idx'
+
+
+def extract_zero_shards_container(temp_dir, ds_checkpoint, indices_3D):
+    """extract_zero_shards, but every fragment goes into this shard's container file."""
+    import numpy as np
+    pp_index, tp_index, dp_index = indices_3D
+    t_task0 = time.perf_counter_ns() if _TIMING else 0
+    sd = ds_checkpoint.get_zero_checkpoint_state(pp_index=pp_index, tp_index=tp_index, dp_index=dp_index)
+    if _TIMING:
+        _timing_shard_load(ds_checkpoint, indices_3D, t_task0, time.perf_counter_ns())
+    optim_sd = sd[OPTIMIZER_STATE_DICT]
+    param_slice_mappings = optim_sd[PARAM_SLICE_MAPPINGS]
+    experts_are_replicated = not (ds_checkpoint._get_checkpoint_value(MOE_UCP_INFO) or {}).get(
+        'expert_tensor_parallel', False)
+    if 'moe_ucp_rank' in optim_sd:
+        raise RuntimeError('rank-local expert names are no longer supported; re-save the checkpoint with a current build')
+    universal_checkpoint_info = ds_checkpoint.get_checkpoint_info(UNIVERSAL_CHECKPOINT_INFO)
+    pipeline_replicated_params = universal_checkpoint_info.get(PIPELINE_REPLICATED_PARAMETER_PATTERNS, [])
+    state_groups = optim_sd[BASE_OPTIMIZER_STATE]["state"]
+    fp32_groups = optim_sd[SINGLE_PARTITION_OF_FP32_GROUPS]
+    bin_path, idx_path = _container_paths(temp_dir, pp_index, tp_index, dp_index)
+    os.makedirs(temp_dir, exist_ok=True)
+    index = {}
+    offset_bytes = 0
+    t_bin0 = time.perf_counter_ns() if _TIMING else 0
+    with open(bin_path, 'wb', buffering=64 << 20) as fh:
+        for param_group_id in range(len(state_groups)):
+            flat_state = dict(
+                exp_avg=state_groups[param_group_id]["exp_avg"],
+                exp_avg_sq=state_groups[param_group_id]["exp_avg_sq"],
+                fp32=fp32_groups[param_group_id],
+            )
+            if "step" in state_groups[param_group_id]:
+                flat_state["step"] = state_groups[param_group_id]["step"]
+            for name, fragment_mapping in param_slice_mappings[param_group_id].items():
+                if pp_index > 0 and any(re.match(pattern, name) for pattern in pipeline_replicated_params):
+                    continue
+                out_tp = 0 if (experts_are_replicated and is_expert_param_name(name)) else tp_index
+                for state_key, flat in flat_state.items():
+                    if state_key == "step" or not torch.is_tensor(flat):
+                        index[(name, out_tp, state_key)] = ('value', flat.item() if torch.is_tensor(flat) else flat)
+                        continue
+                    t0 = time.perf_counter_ns() if _TIMING else 0
+                    frag = flat.narrow(0, fragment_mapping.start, fragment_mapping.numel).contiguous()
+                    arr = frag.detach().cpu().numpy()
+                    arr.tofile(fh)
+                    if _TIMING:
+                        _timing_record('container_frag', name, state_key, out_tp, dp_index, bin_path, arr.nbytes, t0,
+                                       time.perf_counter_ns(), f'offset={offset_bytes}')
+                    index[(name, out_tp, state_key)] = ('frag', offset_bytes, int(frag.numel()), str(arr.dtype))
+                    offset_bytes += arr.nbytes
+    if _TIMING:
+        t_bin1 = time.perf_counter_ns()
+        shard = f'pp{pp_index}_tp{tp_index}_dp{dp_index}'
+        n_frag = sum(1 for e in index.values() if e[0] == 'frag')
+        _timing_record('container_flush', shard, '', tp_index, dp_index, bin_path, offset_bytes, t_bin0, t_bin1,
+                       f'n_frag={n_frag}')
+        t_idx0 = time.perf_counter_ns()
+    with open(idx_path, 'wb') as fh:
+        pickle.dump({'bin': bin_path, 'dp': dp_index, 'entries': index}, fh)
+    if _TIMING:
+        _timing_record('index_write', shard, '', tp_index, dp_index, idx_path, _timing_getsize(idx_path), t_idx0,
+                       time.perf_counter_ns(), f'n_entries={len(index)}')
+        _timing_record('extract_task', shard, '', tp_index, dp_index, temp_dir, '', t_task0, time.perf_counter_ns(),
+                       f'mode=container;n_frag={n_frag}')
+
+
+def build_container_index(temp_dir):
+    """Merge the per-shard indexes into tmp/index.pkl: (name, out_tp, state) -> {dp: entry}. Expert
+    fragments are replicated across TP shards (out_tp = 0); the first shard seen wins, identical content."""
+    merged = {}
+    for idx_path in sorted(glob.glob(os.path.join(temp_dir, 'shard_pp*_tp*_dp*.idx'))):
+        with open(idx_path, 'rb') as fh:
+            rec = pickle.load(fh)
+        for key, entry in rec['entries'].items():
+            slot = merged.setdefault(key, {})
+            if rec['dp'] not in slot:
+                slot[rec['dp']] = (rec['bin'], ) + tuple(entry[1:]) if entry[0] == 'frag' else ('value', entry[1])
+    with open(os.path.join(temp_dir, 'index.pkl'), 'wb') as fh:
+        pickle.dump(merged, fh)
+    n_frag = sum(1 for v in merged.values() for e in v.values() if e[0] != 'value')
+    print(f'*** fragment container index: {len(merged)} (parameter, tp, state) keys, {n_frag} fragments, '
+          f'{len(glob.glob(os.path.join(temp_dir, "shard_pp*_tp*_dp*.bin")))} container files')
+    return merged
+
+
+def _container_index(slice_dir):
+    global _CONTAINER_INDEX
+    if _CONTAINER_INDEX is None:
+        with open(os.path.join(slice_dir, 'index.pkl'), 'rb') as fh:
+            _CONTAINER_INDEX = pickle.load(fh)
+    return _CONTAINER_INDEX
+
+
+def _read_fragment(entry):
+    import numpy as np
+    path, offset, numel, dtype = entry
+    fh = _CONTAINER_HANDLES.get(path)
+    if fh is None:
+        fh = _CONTAINER_HANDLES[path] = open(path, 'rb', buffering=0)
+    fh.seek(offset)
+    arr = np.fromfile(fh, dtype=np.dtype(dtype), count=numel)
+    if arr.shape[0] != numel:
+        raise IOError(f'short read from {path} at {offset}: {arr.shape[0]} of {numel}')
+    return torch.from_numpy(arr)
+
+
+def _merge_zero_shards_container(slice_dir, name, state, tp_degree, slice_shape=None):
+    """Container-mode twin of _merge_zero_shards: same return value, fragments read by offset."""
+    index = _container_index(slice_dir)
+    slices = []
+    for tp_index in range(tp_degree):
+        slot = index.get((name, tp_index, state))
+        if not slot:
+            continue
+        entries = [slot[dp] for dp in sorted(slot)]
+        if state == "step":
+            values = [e[1] for e in entries]
+            assert all(v == values[0] for v in values), "All shards must have the same step value"
+            slice = values[0]
+        else:
+            if _TIMING:
+                shards = [_timing_container_read(e, name, state, tp_index, dp) for dp, e in zip(sorted(slot), entries)]
+            else:
+                shards = [_read_fragment(e) for e in entries]
+            slice = torch.cat(shards, dim=0) if slice_shape is None else torch.cat(shards, dim=0).reshape(slice_shape)
+        slices.append(slice)
+    return slices
+
+
+def _merge_shards(slice_dir, name, state, tp_degree, slice_shape=None):
+    if os.path.exists(os.path.join(slice_dir, 'index.pkl')):
+        return _merge_zero_shards_container(slice_dir, name, state, tp_degree, slice_shape)
+    return _merge_zero_shards(os.path.join(slice_dir, name), state, tp_degree, slice_shape)
+
+
 def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
     name, shape = name_and_shape
@@ -573,7 +734,7 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
     matched_sub_params_shape = get_matched_sub_params_pattern(name)
 
-    step_merged = _merge_zero_shards(slice_base_path, "step", tp_degree, shape)
+    step_merged = _merge_shards(slice_dir, name, "step", tp_degree, shape)
     if step_merged:
         t0 = time.perf_counter_ns() if _TIMING else 0
         _save_checkpoint(os.path.join(param_base_path, f"step.pt"), step_merged[0])
@@ -583,6 +744,7 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
     for state in ("fp32", "exp_avg", "exp_avg_sq"):
         t_read0 = time.perf_counter_ns() if _TIMING else 0
+        slices = _merge_shards(slice_dir, name, state, tp_degree, shape)
         t_read1 = time.perf_counter_ns() if _TIMING else 0
         final_path = os.path.join(param_base_path, f"{state}.pt")
 
@@ -703,6 +865,15 @@ def _extract_zero_shard_files(args, ds_checkpoint, temp_dir):
 
     if _TIMING:
         _timing_set_role('extract')
+    if getattr(args, 'fragment_container', False):
+        print('*** fragment containers: one raw file + index per ZeRO shard instead of per-fragment files')
+        do_work = partial(extract_zero_shards_container, temp_dir, ds_checkpoint)
+        _do_parallel_work(do_work, _3d_range_list, num_workers)
+        t0, t_abs0 = (time.perf_counter_ns(), time.time()) if _TIMING else (0, 0.0)
+        build_container_index(temp_dir)
+        if _TIMING:
+            _timing_phase_end('index_build', t0, t_abs0, f'path={os.path.join(temp_dir, "index.pkl")}')
+        return
     do_work = partial(extract_zero_shards, temp_dir, ds_checkpoint)
     _do_parallel_work(do_work, _3d_range_list, num_workers)
 

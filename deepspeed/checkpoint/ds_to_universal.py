@@ -9,6 +9,7 @@ from functools import partial
 from itertools import chain
 import argparse
 import glob
+import pickle
 import itertools
 import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -25,6 +26,8 @@ import tqdm
 #from pprint import pprint
 
 from deepspeed.checkpoint import DeepSpeedCheckpoint
+from deepspeed.checkpoint.reshape_utils import get_zero_files
+from deepspeed.checkpoint.utils import load_checkpoint_file
 from deepspeed.checkpoint import (
     OPTIMIZER_STATE_DICT,
     ZERO_STAGE,
@@ -136,6 +139,12 @@ def parse_arguments():
         help='[X-MoE, 2026-09-05] Extract phase writes ONE raw container per ZeRO shard plus an index instead of '
         'one file per (parameter, state, shard); the merge reads fragments by offset. Same atoms, '
         'far fewer files (19k-95k fewer creates and reads for the 10B on Frontier Lustre). Stage 1/2 only.')
+    parser.add_argument(
+        '--optstate-from-pickle',
+        action='store_true',
+        help='[X-MoE, 2026-09-06, proposal C9] Build zero/optimizer_state.pt from the shards\' pickles (about 70 KB '
+        'each) instead of loading one whole shard per pipeline stage. Falls back to the whole-shard path, with a '
+        'printed notice, if a non-sharded value turns out to be a tensor.')
     parser.add_argument('--num_extract_workers',
                         default=4,
                         type=int,
@@ -689,6 +698,156 @@ def _merge_zero_shards_container(slice_dir, name, state, tp_degree, slice_shape=
     return slices
 
 
+# ----------------------------------------------------------------------------------------------
+# [X-MoE, 2026-09-06] Shard metadata without the tensor bytes (proposals C9 and C0 of
+# ucp_io/round2/PROPOSALS_0906_2026.md). A ZeRO shard is a torch.save zip: 'data.pkl' (about 70 KB
+# at 63B) names every value and, for every tensor, the storage record ('data/<key>'), the storage
+# offset, the size and the dtype; the storage records carry the bytes, one record per flat
+# partition (45 at 63B, up to 692 MB each). Reading the pickle with the tensors replaced by
+# _TensorRef placeholders gives everything the converter needs except the values:
+#   C9 (--optstate-from-pickle): zero/optimizer_state.pt holds only non-tensor values, so it can be
+#       built from the placeholders' dict; today the same dict is obtained by loading 25.8 GB per
+#       pipeline stage (82 s of a 1,344 s 63B conversion for a 2,781-byte file).
+#   C0 (--fragments-inplace): the byte offset of a parameter's fragment inside its shard is
+#       record_offset + (storage_offset + fragment.start) * itemsize, so the merge can read it
+#       from the shard directly. The index has the container mode's format with the shard as the
+#       'bin', and the container merge path (_read_fragment, read-only) is reused unchanged.
+# Measured before this code was written (round 2, N3/N3c, 2026-09-06): index of a shard about 1 s,
+# offsets exact against torch.load, 52 ms per cold 31.5 MB fragment read with four readers.
+# ----------------------------------------------------------------------------------------------
+class _TensorRef(object):
+    """Placeholder for a tensor in a shard's pickle: where its bytes are, not the bytes."""
+    __slots__ = ('key', 'dtype', 'storage_offset', 'size', 'numel')
+
+    def __init__(self, key, dtype, storage_offset, size):
+        self.key, self.dtype, self.storage_offset, self.size = key, dtype, int(storage_offset), tuple(int(x) for x in size)
+        self.numel = int(math.prod(self.size)) if len(self.size) else 1
+
+    def __repr__(self):
+        return f'_TensorRef(key={self.key}, dtype={self.dtype}, storage_offset={self.storage_offset}, size={self.size})'
+
+
+class _Placeholder(object):
+    """A storage in the pickle: record key, dtype, element count. Never holds data."""
+    __slots__ = ('key', 'dtype', 'numel')
+
+    def __init__(self, key, dtype, numel):
+        self.key, self.dtype, self.numel = key, dtype, int(numel)
+
+
+def _load_shard_meta(path):
+    """torch.load without the tensor bytes. Returns (state_dict with _TensorRef placeholders,
+    {storage key: byte offset of the record's payload in the file}, pickle size in bytes)."""
+    import io
+    reader = torch._C.PyTorchFileReader(path)
+    names = reader.get_all_records()
+    prefix = 'archive/' if ('archive/data.pkl' in names and 'data.pkl' not in names) else ''
+    record_offsets = {}
+    for n in names:
+        if n.startswith(prefix + 'data/'):
+            record_offsets[n[len(prefix + 'data/'):]] = int(reader.get_record_offset(n))
+    pkl = bytes(reader.get_record(prefix + 'data.pkl'))
+
+    def rebuild_tensor(storage, storage_offset, size, stride, *rest):
+        return _TensorRef(storage.key, storage.dtype, storage_offset, size)
+
+    class _MetaUnpickler(pickle.Unpickler):
+
+        def persistent_load(self, pid):
+            typename, storage_type, key, location, numel = pid[0], pid[1], pid[2], pid[3], pid[4]
+            assert typename == 'storage', f'unknown persistent id {typename!r} in {path}'
+            if isinstance(storage_type, str):
+                dtype = torch.serialization._get_dtype_from_pickle_storage_type(storage_type)
+            else:
+                dtype = storage_type.dtype
+            return _Placeholder(str(key), dtype, numel)
+
+        def find_class(self, module, name):
+            if module == 'torch._utils' and name in ('_rebuild_tensor_v2', '_rebuild_tensor'):
+                return rebuild_tensor
+            return super().find_class(module, name)
+
+    sd = _MetaUnpickler(io.BytesIO(pkl)).load()
+    return sd, record_offsets, len(pkl)
+
+
+def _walk_for_tensor_refs(obj, found, path='root', depth=0):
+    """Collect the paths of every _TensorRef / tensor / _Placeholder inside a value (dicts, lists,
+    tuples, objects with __dict__)."""
+    if depth > 12:
+        return
+    if isinstance(obj, (_TensorRef, _Placeholder)) or torch.is_tensor(obj):
+        found.append(path)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _walk_for_tensor_refs(v, found, f'{path}.{k}', depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _walk_for_tensor_refs(v, found, f'{path}[{i}]', depth + 1)
+    elif hasattr(obj, '__dict__'):
+        _walk_for_tensor_refs(vars(obj), found, path, depth + 1)
+
+
+_NUMPY_DTYPE_OF = {torch.float32: 'float32', torch.float64: 'float64', torch.float16: 'float16',
+                   torch.int64: 'int64', torch.int32: 'int32', torch.uint8: 'uint8', torch.int8: 'int8', torch.int16: 'int16'}
+
+
+def _save_optimizer_state_from_pickle(args, ds_checkpoint):
+    """C9: the same output as _save_optimizer_state, built from each stage's shard pickle instead of the
+    whole shard. Returns True when zero/optimizer_state.pt was written; False (nothing written) when the
+    fast path does not apply, so that the caller runs the whole-shard path."""
+    sharded_states = [BASE_OPTIMIZER_STATE, PARAM_SLICE_MAPPINGS, SINGLE_PARTITION_OF_FP32_GROUPS]
+    zc = ds_checkpoint.zero_checkpoint
+
+    def stage_optim_sd(pp_index):
+        files = zc.get_files_for_rank(pp_index, 0, 0)
+        if len(files) != 1:
+            return None
+        t0 = time.perf_counter_ns() if _TIMING else 0
+        sd, _, pkl_bytes = _load_shard_meta(files[0])
+        if _TIMING:
+            _timing_record('optstate_pickle', f'pp{pp_index}_tp0_dp0', '', 0, 0, files[0], pkl_bytes, t0,
+                           time.perf_counter_ns(), 'phase=optstate')
+        # what get_state_for_rank does to the non-tensor keys (zero_checkpoint.py): the target dp degree
+        # in partition_count and paddings cleared; the sharded states are dropped below, so their padding
+        # strip is not needed
+        zc._update_partition_count(sd)
+        zc._clear_group_paddings(sd)
+        return sd[OPTIMIZER_STATE_DICT]
+
+    optim_sd = stage_optim_sd(0)
+    if optim_sd is None:
+        print('*** --optstate-from-pickle: a reshaped file map (several files per rank); using the whole-shard path')
+        return False
+    output_sd = {k: v for k, v in optim_sd.items() if k not in sharded_states}
+    param_groups = optim_sd[BASE_OPTIMIZER_STATE][PARAM_GROUPS]
+    for pp_index in range(1, ds_checkpoint.pp_degree):
+        stage_sd = stage_optim_sd(pp_index)
+        if stage_sd is None:
+            print('*** --optstate-from-pickle: a reshaped file map (several files per rank); using the whole-shard path')
+            return False
+        stage_groups = stage_sd[BASE_OPTIMIZER_STATE][PARAM_GROUPS]
+        if len(stage_groups) > len(param_groups):
+            param_groups = stage_groups
+    output_sd[PARAM_GROUPS] = param_groups
+    refs = []
+    _walk_for_tensor_refs(output_sd, refs)
+    if refs:
+        print(f'*** --optstate-from-pickle: {len(refs)} tensor value(s) among the shared settings ({refs[:3]}); '
+              'using the whole-shard path so that they are written with their bytes')
+        if _TIMING:
+            _timing_record('optstate_pickle_fallback', 'optimizer_state', '', '', '', '', '', 0, 0, ';'.join(refs[:5]))
+        return False
+    zero_output_folder = os.path.join(args.output_folder, "zero")
+    output_file_path = os.path.join(zero_output_folder, f"optimizer_state.pt")
+    t0 = time.perf_counter_ns() if _TIMING else 0
+    _save_checkpoint(output_file_path, output_sd)
+    if _TIMING:
+        _timing_record('optstate_write', 'optimizer_state', '', '', '', output_file_path,
+                       _timing_getsize(output_file_path), t0, time.perf_counter_ns(), 'source=pickle')
+    return True
+
+
 def _merge_shards(slice_dir, name, state, tp_degree, slice_shape=None):
     if os.path.exists(os.path.join(slice_dir, 'index.pkl')):
         return _merge_zero_shards_container(slice_dir, name, state, tp_degree, slice_shape)
@@ -922,6 +1081,8 @@ def _parse_model_states_stage3(files):
 
 
 def _save_optimizer_state(args, ds_checkpoint):
+    if getattr(args, 'optstate_from_pickle', False) and _save_optimizer_state_from_pickle(args, ds_checkpoint):
+        return
     sharded_states = [BASE_OPTIMIZER_STATE, PARAM_SLICE_MAPPINGS, SINGLE_PARTITION_OF_FP32_GROUPS]
     t0 = time.perf_counter_ns() if _TIMING else 0
     sd = ds_checkpoint.get_zero_checkpoint_state(pp_index=0, tp_index=0, dp_index=0)

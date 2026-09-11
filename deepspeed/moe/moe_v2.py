@@ -189,9 +189,23 @@ class TopKGatev2(Module):
         assert self.ep_group is None, f'Attempting to override an existing ep_group'
         self.ep_group = ep_group
 
+    def _apply(self, fn, recurse=True):
+        # The engine casts the whole module to bf16 (engine._configure_distributed_model: self.module.bfloat16()), buffers
+        # included. The balancing bias and the load accumulator stay fp32 under that cast: the bias moves by the speed (0.001)
+        # per step and a bf16 bias stops moving once |bias| reaches 0.25 (an ulp of 2^-9 there, 2^-8 at 0.5), and the loads are
+        # token counts that bf16 rounds above 256. Found 2026-09-11 in run G's layer files (the bias saved as bf16).
+        r = super()._apply(fn, recurse) if 'recurse' in super()._apply.__code__.co_varnames else super()._apply(fn)
+        for name in ('expert_bias', 'load_acc'):
+            buf = self._buffers.get(name)
+            if buf is not None and buf.dtype != torch.float32:
+                self._buffers[name] = buf.float()
+        return r
+
     def forward(self,
                 input: torch.Tensor,
-                use_pft: bool = False) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
+                use_pft: bool = False,
+                n_sequences: Union[int, None] = None) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
+        # n_sequences: the sequences interleaved in the token axis (the b of [s, b, h]); only the sequence-wise loss (seq_aux) reads it
 
         if self.wall_clock_breakdown:
             self.timers(TOPK_GATE_TIMER).start()

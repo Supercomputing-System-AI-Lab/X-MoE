@@ -152,6 +152,12 @@ def parse_arguments():
         help='[X-MoE, 2026-09-06, proposal C9] Build zero/optimizer_state.pt from the shards\' pickles (about 70 KB '
         'each) instead of loading one whole shard per pipeline stage. Falls back to the whole-shard path, with a '
         'printed notice, if a non-sharded value turns out to be a tensor.')
+    parser.add_argument(
+        '--merge-writer-thread',
+        action='store_true',
+        help='[X-MoE, 2026-09-07, proposal C10] Each merge worker hands its atom writes (torch.save) to a writer '
+        'thread with a queue of one, so the next tensor\'s fragment reads run while the previous tensor\'s three '
+        'atoms drain. Same files, same contents; the merge task then measures reads + joins only.')
     parser.add_argument('--num_extract_workers',
                         default=4,
                         type=int,
@@ -938,6 +944,80 @@ def _save_optimizer_state_from_pickle(args, ds_checkpoint):
     return True
 
 
+# ----------------------------------------------------------------------------------------------
+# [X-MoE, 2026-09-07] C10: a writer thread per merge worker (--merge-writer-thread).
+# The merge worker's clock today is dispatch + reads + writes in a row (an expert-weight task at 63B:
+# 53 + 3 x 53 + 3 x 40 ms, measured 2026-09-06). With the three atom writes handed to a thread that
+# holds a queue of one, the next task's reads overlap the previous task's writes and the worker's
+# clock advances by the longer side, max(dispatch + reads, writes). The thread runs the same
+# _save_checkpoint, so the files and their contents do not change. It is not a daemon: the worker
+# process joins it at exit (multiprocessing's _bootstrap calls threading._shutdown), and it stops on
+# its own once the main thread has stopped and its queue is empty, so a worker never hangs at exit.
+# A failed write is recorded in _WRITER_ERROR, raised by the next _writer_put of that worker, and left
+# as a marker file in the temporary folder that the main process checks after the pool.
+# ----------------------------------------------------------------------------------------------
+import threading
+_MERGE_WRITER_THREAD = False   # set by _merge_tp_slice_files before the merge pool is forked; inherited by the workers
+_WRITER_MARK_DIR = None        # the temporary folder, for the failure markers
+_WRITER = None                 # per worker process: (thread, queue)
+_WRITER_ERROR = None
+
+
+def _writer_loop(q):
+    global _WRITER_ERROR
+    import queue as _queue
+    main = threading.main_thread()
+    while True:
+        try:
+            item = q.get(timeout=0.5)
+        except _queue.Empty:
+            if not main.is_alive():   # the worker is shutting down and nothing is left to write
+                return
+            continue
+        final_path, ckpt_dict, name, state, nbytes, n_slices, t_read0, t_read1, t_queued = item
+        t0 = time.perf_counter_ns() if _TIMING else 0
+        try:
+            _save_checkpoint(final_path, ckpt_dict)
+            if _TIMING:
+                _timing_record('atom_write', name, state, '', '', final_path, nbytes, t0, time.perf_counter_ns(),
+                               f'n_slices={n_slices};read_ns={t_read1 - t_read0};merge_ns={t_queued - t_read1};'
+                               f'writer=thread;wait_ns={t0 - t_queued}')
+        except Exception as e:
+            _WRITER_ERROR = e
+            try:
+                with open(os.path.join(_WRITER_MARK_DIR or os.path.dirname(final_path), f'WRITER_ERROR_{os.getpid()}'), 'a') as fh:
+                    fh.write(f'{final_path}: {type(e).__name__}: {e}\n')
+            except Exception:
+                pass
+        finally:
+            del ckpt_dict, item
+            q.task_done()
+
+
+def _writer_put(final_path, ckpt_dict, name, state, nbytes, n_slices, t_read0, t_read1):
+    """Queue one atom for this worker's writer thread, started on first use. The queue holds one item, so
+    the put blocks while a previous atom is still waiting: at most one task's atoms wait behind the one
+    being written, and the memory of a worker grows by at most two tensors."""
+    global _WRITER
+    if _WRITER_ERROR is not None:
+        raise RuntimeError(f'writer thread of pid {os.getpid()} failed earlier: {_WRITER_ERROR!r}')
+    if _WRITER is None:
+        import queue as _queue
+        q = _queue.Queue(maxsize=1)
+        th = threading.Thread(target=_writer_loop, args=(q,), name='ucp-atom-writer', daemon=False)
+        th.start()
+        _WRITER = (th, q)
+    _WRITER[1].put((final_path, ckpt_dict, name, state, nbytes, n_slices, t_read0, t_read1,
+                    time.perf_counter_ns() if _TIMING else 0))
+
+
+def _writer_drain():
+    """Wait until this worker's writer has written everything queued so far (used by the tests; a worker's
+    exit joins the thread anyway)."""
+    if _WRITER is not None:
+        _WRITER[1].join()
+
+
 def _merge_shards(slice_dir, name, state, tp_degree, slice_shape=None):
     if os.path.exists(os.path.join(slice_dir, 'index.pkl')):
         return _merge_zero_shards_container(slice_dir, name, state, tp_degree, slice_shape)
@@ -1052,6 +1132,10 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
         #print(f"Final shape: {param.shape}")
         ckpt_dict[PARAM] = param
+        if _MERGE_WRITER_THREAD:   # [X-MoE, 2026-09-07] C10: the write goes to this worker's writer thread
+            _writer_put(final_path, ckpt_dict, name, state, _timing_nbytes(param) if _TIMING else '', len(slices), t_read0, t_read1)
+            continue
+        t0 = time.perf_counter_ns() if _TIMING else 0
         _save_checkpoint(final_path, ckpt_dict)
         if _TIMING:
             _timing_record('atom_write', name, state, '', '', final_path, _timing_nbytes(param), t0,
@@ -1148,7 +1232,15 @@ def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
         _timing_set_role('merge')
     zero_output_folder = os.path.join(args.output_folder, "zero")
     do_work = partial(merge_tp_slices, ds_checkpoint, zero_output_folder, temp_dir, ds_checkpoint.tp_degree)
+    global _MERGE_WRITER_THREAD, _WRITER_MARK_DIR
+    if getattr(args, 'merge_writer_thread', False):   # [X-MoE, 2026-09-07] C10
+        _MERGE_WRITER_THREAD, _WRITER_MARK_DIR = True, temp_dir
+        print('*** merge writer thread: each merge worker writes its atoms from a thread with a queue of one')
     unmatched_patterns_lists = _do_parallel_work(do_work, list(slice_shapes.items()), args.num_merge_workers)
+    if _MERGE_WRITER_THREAD:   # [X-MoE, 2026-09-07] C10: the pool has joined its workers, and each worker its writer thread
+        marks = glob.glob(os.path.join(temp_dir, 'WRITER_ERROR_*'))
+        if marks:
+            raise RuntimeError('atom writes failed in the writer thread(s): ' + '; '.join(open(m).read().strip() for m in marks))
 
     # verify that all patterns were used
     # if a pattern was not used by any of the workers, then it was not used at all -> assert/alert

@@ -414,6 +414,8 @@ USE_NODE_LOCAL_STORAGE_CHECKPOINT_DEFAULT = False
 CHECKPOINT_PARALLEL_WRITE = "parallel_write"
 CHECKPOINT_PARALLEL_WRITE_PIPELINE_STAGE = "pipeline_stage"
 CHECKPOINT_PARALLEL_WRITE_PIPELINE_STAGE_DEFAULT = False
+CHECKPOINT_ASYNC_PINNED = "async_pinned"                 # [X-MoE, 2026-09-07] S2: checkpoint::async_pinned = true
+CHECKPOINT_ASYNC_PINNED_DEFAULT = False
 
 #########################################
 # Data types config params

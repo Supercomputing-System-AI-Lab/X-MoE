@@ -1098,6 +1098,12 @@ class DeepSpeedEngine(Module):
 
     def _configure_checkpointing(self, dist_init_required):
         self.checkpoint_engine = TorchCheckpointEngine()
+        # [X-MoE, 2026-09-07] S2: the asynchronous pinned-memory engine, chosen by the config key
+        # checkpoint::async_pinned or by DS_ASYNC_PINNED_CHECKPOINT=1 in the environment (no launcher change needed)
+        if os.environ.get('DS_ASYNC_PINNED_CHECKPOINT') == '1' or (self._config is not None and getattr(self._config, 'checkpoint_async_pinned', False)):
+            from deepspeed.runtime.checkpoint_engine.async_pinned_checkpoint_engine import AsyncPinnedCheckpointEngine
+            self.checkpoint_engine = AsyncPinnedCheckpointEngine()
+            log_dist('[AsyncPinned] checkpoint engine: snapshots to pinned host memory, writes in the background, publishes latest when every rank is done', ranks=[0])
 
         if self._config is not None and self._config.nebula_config.enabled:
             try:
@@ -3485,6 +3491,8 @@ class DeepSpeedEngine(Module):
 
         # Save latest checkpoint tag
         self.checkpoint_engine.commit(tag)
+        if getattr(self.checkpoint_engine, 'writes_latest', False):   # [X-MoE, 2026-09-07] S2: the engine publishes 'latest' itself, when the writes are done
+            save_latest = False
         if save_latest and rank == 0:
             with open(os.path.join(save_dir, 'latest'), 'w') as fd:
                 fd.write(tag)

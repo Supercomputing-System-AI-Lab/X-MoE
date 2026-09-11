@@ -902,6 +902,8 @@ class DeepSpeedConfig(object):
 
         par_write_pipe = get_checkpoint_parallel_write_pipeline(checkpoint_params)
         self.checkpoint_parallel_write_pipeline = par_write_pipe
+        # [X-MoE, 2026-09-07] S2: the asynchronous pinned-memory checkpoint engine (also DS_ASYNC_PINNED_CHECKPOINT=1)
+        self.checkpoint_async_pinned = bool(checkpoint_params.get(CHECKPOINT_ASYNC_PINNED, CHECKPOINT_ASYNC_PINNED_DEFAULT))
 
         self.aio_config = get_aio_config(param_dict)
 

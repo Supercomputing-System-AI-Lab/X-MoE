@@ -342,14 +342,19 @@ def merge_tensors(tensor_objects, non_tensor_objects, tensor_flags):
 
     # remove the flags that are assigned to the size of the flattened tensors
     if PARTITION_ACTIVATIONS:
-        real_tensor_flags = []
-        previous_flag = False
-        for flag in tensor_flags:
-            if previous_flag:
-                previous_flag = False
-                continue
-            previous_flag = flag
-            real_tensor_flags.append(flag)
+        # X-MoE 128k S2 arity fix -- get_partitioned_activations_for_backward
+        # saves exactly TWO entries per original arg: (arg, size), where size
+        # is a tensor iff arg is a tensor and None otherwise. Collapse both
+        # the flags and the non-tensor slots by stride 2 to recover one entry
+        # per original arg. The previous collapse skipped an entry only after
+        # a True flag, so every non-tensor arg's (None, None) pair survived
+        # whole: a checkpoint call with k non-tensor args delivered
+        # len(args) + k args to the backward recompute (transformer.py's
+        # 9-arg call with 6 Nones -> 15 args into a 9-positional forward,
+        # TypeError at the first backward). Collapsing only the flags would
+        # still hand each None size placeholder out as a later arg's value.
+        real_tensor_flags = tensor_flags[0::2]
+        non_tensor_objects = non_tensor_objects[0::2]
     else:
         real_tensor_flags = tensor_flags
 
@@ -367,9 +372,34 @@ def merge_tensors(tensor_objects, non_tensor_objects, tensor_flags):
 def is_activation_to_checkpoint(item):
     """
         Is an activation to be checkpointed
+
+        X-MoE 128k S3.4 rotary fix -- the `item.requires_grad` guard:
+        partition_activations / get_partitioned_activations_for_backward /
+        get_cpu_activations_for_backward free each qualifying arg in place
+        (`arg.data = torch.empty([])`) on the assumption that the arg is
+        private to one checkpointed call. Megatron-DeepSpeed-X-MoE threads
+        ONE shared rotary freqs tensor (language_model.py:596) into every
+        layer's checkpoint, so under --checkpoint-in-cpu or
+        --partition-activations the first layer's save hollows the tensor
+        the next layer is about to read: freqs.shape becomes () and
+        apply_rotary_pos_emb raises IndexError at rotary_pos_embedding.py:65
+        (jobs 5355702/5355703/5355704 -- three lengths, one traceback).
+
+        Grad-free float tensors are therefore exempted: they ride the same
+        save-by-reference branch that bool attention masks and int32
+        cu_seqlens already ride, and are never hollowed, partitioned, or
+        offloaded. This is safe for real activations because every
+        checkpoint-boundary activation in training requires grad (it carries
+        the graph back to the previous stage/embedding). Cost: a grad-free
+        float input (rotary freqs is the only one on this fork's layer
+        signature) stays resident on device -- s * head_dim/2 * 4 B, ~32 MiB
+        at s=131,072, vs. the layer boundary it used to corrupt. Under
+        torch.no_grad() (eval) nothing is offloaded, which is memory-neutral
+        because no backward retains it.
     """
     global mp_size
-    return torch.is_tensor(item) and item.is_floating_point() and item.numel() >= mp_size
+    return torch.is_tensor(item) and item.is_floating_point() and item.numel() >= mp_size \
+        and item.requires_grad
 
 
 def partition_activations(args, cpu_checkpoint, contiguous_checkpoint):

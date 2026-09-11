@@ -9,6 +9,7 @@ import torch
 from deepspeed.utils import logger
 from deepspeed.utils.tensor_fragment import map_to_flat_opt_states
 from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank
+from deepspeed.checkpoint.utils import load_checkpoint_file
 
 
 class DeepSpeedOptimizer(object):

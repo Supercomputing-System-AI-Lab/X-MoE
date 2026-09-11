@@ -150,7 +150,7 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
 
 
 def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, dp_index):
-    state_dict = torch.load(optim_files[dp_index], map_location='cpu')
+    state_dict = load_checkpoint_file(optim_files[dp_index])
 
     flat_state = dict(
         exp_avg=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg"],
@@ -404,7 +404,7 @@ def _zero_partitioned_param_info(unpartitioned_numel, world_size):
 
 
 def _parse_model_states_stage3(files):
-    return torch.load(files[0], map_location=torch.device('cpu'))[PARAM_SHAPES]
+    return load_checkpoint_file(files[0])[PARAM_SHAPES]
 
 
 def _save_optimizer_state(args, ds_checkpoint):
@@ -420,7 +420,7 @@ def _save_optimizer_state(args, ds_checkpoint):
 
 
 def _save_optimizer_state_stage3(args, optim_files):
-    sd = torch.load(optim_files[0], map_location=torch.device('cpu'))
+    sd = load_checkpoint_file(optim_files[0])
     output_sd = sd[OPTIMIZER_STATE_DICT]
     output_sd[PARAM_GROUPS] = output_sd[OPTIMIZER_STATE_DICT][PARAM_GROUPS]
     zero_output_folder = os.path.join(args.output_folder, "zero")
@@ -446,7 +446,7 @@ def _get_checkpoint_files(checkpoint_dir, glob_pattern):
 
 
 def _get_zero_stage(optim_files):
-    state_dict = torch.load(optim_files[0], map_location=torch.device('cpu'))
+    state_dict = load_checkpoint_file(optim_files[0])
     optimizer_state = state_dict[OPTIMIZER_STATE_DICT]
     zero_stage = optimizer_state.get(ZERO_STAGE, 1)
     return zero_stage
@@ -454,7 +454,7 @@ def _get_zero_stage(optim_files):
 
 def _inject_missing_state(ds_checkpoint):
     if UNIVERSAL_CHECKPOINT_INFO not in ds_checkpoint.global_state:
-        sd = torch.load(ds_checkpoint.mp_rank_files[0], map_location=torch.device('cpu'))
+        sd = load_checkpoint_file(ds_checkpoint.mp_rank_files[0])
         if UNIVERSAL_CHECKPOINT_INFO not in sd:
             ds_checkpoint.global_state[UNIVERSAL_CHECKPOINT_INFO] = {}
             ds_checkpoint.global_state[UNIVERSAL_CHECKPOINT_INFO][
@@ -488,7 +488,7 @@ def main(args):
 
         slice_shapes = []
         for mp_rank_file in ds_checkpoint.mp_rank_files:
-            mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'))
+            mp_sd = load_checkpoint_file(mp_rank_file)
             slice_shapes += mp_sd[PARAM_SHAPES]
 
         # fix back to normal flat dict, merge duplicates for tp>1

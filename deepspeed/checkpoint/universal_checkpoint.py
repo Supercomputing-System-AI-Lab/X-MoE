@@ -10,6 +10,7 @@ import types
 from typing import List, Tuple, Union
 from dataclasses import dataclass
 from .constants import (FP32_WEIGHT_KEY, PARAM, VOCAB_TENSOR, CAT_DIM, PARAM_N_SUB_PARAMS, SUB_PARAM_SHAPE)
+from .utils import load_checkpoint_file
 
 
 @dataclass

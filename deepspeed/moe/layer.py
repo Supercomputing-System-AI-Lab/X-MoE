@@ -91,6 +91,7 @@ class MoE(nn.Module):
                  topk_group: int = 1,
                  norm_topk_prob: bool = False,
                  routed_scaling_factor: float = 1.0,
+                 moe_seq_balance_coeff: float = 0.0,   # > 0: the sequence-wise balance loss (seq_aux) instead of the batch-wise one
                  ) -> None:
 
         super(MoE, self).__init__()
@@ -162,7 +163,8 @@ class MoE(nn.Module):
                 v3_router = dict(score_function=("sigmoid" if scoring_func == "sigmoid" else "softmax"),
                                  bias_update_speed=(moe_router_bias_update_speed if topk_method == "noaux_tc" else 0.0),
                                  n_group=n_group, topk_group=topk_group, norm_topk_prob=norm_topk_prob,
-                                 routed_scaling_factor=routed_scaling_factor)
+                                 routed_scaling_factor=routed_scaling_factor,
+                                 seq_aux=(moe_seq_balance_coeff > 0.0))
             gate = TopKGatev2(**gate_params, softmax_before_topk=softmax_before_topk, **v3_router)
         else:
             assert scoring_func is None and topk_method is None, \

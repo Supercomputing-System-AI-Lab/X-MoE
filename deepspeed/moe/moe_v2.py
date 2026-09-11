@@ -63,6 +63,8 @@ def topkgating_unbalanced(
     topk_group: int = 1,
     norm_topk_prob: bool = False,
     routed_scaling_factor: float = 1.0,
+    seq_aux: bool = False,
+    n_sequences: Union[int, None] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements TopKGating on logits.
 
@@ -70,6 +72,10 @@ def topkgating_unbalanced(
     the logit; the choice adds the balancing bias (expert_bias, no gradient) and keeps the topk_group best of n_group expert
     groups (a group scores by the sum of its two best affinities); the weights are the unbiased affinities of the chosen
     experts, normalised to sum 1 when norm_topk_prob, times routed_scaling_factor. The default keeps the gate as it was.
+
+    seq_aux (the released DeepSeek gate's config.json switch) makes the returned balance loss the sequence-wise one of the
+    DeepSeek-V3 report (eq. 17-20): one loss per sequence, averaged over the n_sequences interleaved in the token axis (the b
+    of Megatron's [s, b, h] layout: token t belongs to sequence t mod b). Off, the loss is the batch-wise one over all tokens.
     """
 
     # everything is in fp32 in this function
@@ -98,9 +104,21 @@ def topkgating_unbalanced(
         scores = F.softmax(logits, dim=1)
 
     mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, top_idx, 1)
-    me = torch.mean(scores, dim=0)
-    ce = torch.mean(mask.float(), dim=0)
-    l_aux = torch.mean(me * ce) * n_experts * n_experts / k
+    if seq_aux:
+        # the sequence-wise balance loss (DeepSeek-V3 report eq. 17-20) per sequence: P_i = the mean over its tokens of the
+        # normalised affinity s'_{i,t} = s_{i,t} / sum_j s_{j,t} (eq. 20; the identity for softmax scores), f_i = n_experts /
+        # (k T) x the number of its tokens that chose expert i (the chosen set, before any capacity drop); loss = sum_i f_i P_i,
+        # then the mean over the sequences. Under a TP token shard the caller scales by 1/TP as for the batch-wise loss.
+        assert n_sequences is not None and scores.shape[0] % n_sequences == 0, \
+            f"seq_aux needs the number of sequences interleaved in the {scores.shape[0]} tokens (got {n_sequences})"
+        p_norm = scores / scores.sum(dim=1, keepdim=True)
+        seq_p = p_norm.view(-1, n_sequences, n_experts).mean(dim=0)                               # [b, E]
+        seq_f = mask.float().view(-1, n_sequences, n_experts).mean(dim=0) * (n_experts / k)     # [b, E], no gradient
+        l_aux = (seq_f * seq_p).sum(dim=1).mean()
+    else:
+        me = torch.mean(scores, dim=0)
+        ce = torch.mean(mask.float(), dim=0)
+        l_aux = torch.mean(me * ce) * n_experts * n_experts / k
 
     expert_weights = top_gate.flatten()
     top_experts = top_idx.flatten()
@@ -152,6 +170,7 @@ class TopKGatev2(Module):
                  topk_group: int = 1,
                  norm_topk_prob: bool = False,
                  routed_scaling_factor: float = 1.0,
+                 seq_aux: bool = False,
                  ) -> None:
         super().__init__()
 
@@ -165,6 +184,7 @@ class TopKGatev2(Module):
         self.topk_group = int(topk_group)
         self.norm_topk_prob = bool(norm_topk_prob)
         self.routed_scaling_factor = float(routed_scaling_factor)
+        self.seq_aux = bool(seq_aux)      # the sequence-wise balance loss (DeepSeek-V3 report eq. 17-20) instead of the batch-wise one
         if self.bias_update_speed > 0.0:
             self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32))
             self.register_buffer("load_acc", torch.zeros(num_experts, dtype=torch.float32), persistent=False)
@@ -224,7 +244,8 @@ class TopKGatev2(Module):
                                 expert_bias=getattr(self, "expert_bias", None),
                                 n_group=self.n_group, topk_group=self.topk_group,
                                 norm_topk_prob=self.norm_topk_prob,
-                                routed_scaling_factor=self.routed_scaling_factor)
+                                routed_scaling_factor=self.routed_scaling_factor,
+                                seq_aux=self.seq_aux, n_sequences=n_sequences)
         if self.bias_update_speed > 0.0 and self.training:
             # the tokens each expert received in this micro-batch (the 6th return, tokens_per_expert), summed until the step
             with torch.no_grad():
@@ -332,7 +353,9 @@ class MOEv2Layer(Base):
             n_tokens = reshaped_input.shape[0]
 
             if self.use_pft:
-                self.l_aux, indices, bin_ids, bins, expert_weights, input_splits_tensor = self.gate(reshaped_input, use_pft=True)
+                # n_sequences: the b of the layer's [s, b, h] input (a TP shard keeps that structure); read only by seq_aux
+                self.l_aux, indices, bin_ids, bins, expert_weights, input_splits_tensor = self.gate(
+                    reshaped_input, use_pft=True, n_sequences=(input[0].shape[1] if input[0].dim() == 3 else None))
                 if moe_sequence_sharded:
                     # The gate ran on a 1/TP token shard, so every TP rank
                     # contributes its own shard-local l_aux to the loss and the

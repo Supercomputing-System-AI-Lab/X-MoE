@@ -3,6 +3,7 @@ from deepspeed.utils import logger
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_world_size
 from typing import Callable, Dict, TYPE_CHECKING, Any, Optional, Tuple, Union
 
+import os
 import sys
 import torch
 from torch import Tensor

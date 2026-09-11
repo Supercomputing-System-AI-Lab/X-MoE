@@ -3336,8 +3336,26 @@ class DeepSpeedEngine(Module):
         """
             Get the state dict of the non-moe layers
         """
+        # ===== IMPLEMENTING SHARED EXPERT =====
+        #   Changed: the expert-vs-non-expert classifier here.
+        #   BEFORE:  if 'expert' in key and 'moe.gate.wg.weight' not in key:
+        #   WHY:     the loose substring 'expert' ALSO matches 'shared_experts'
+        #            (key ...mlp.shared_experts.shared_mlp.dense_h_to_4h.weight), so the
+        #            shared expert was wrongly popped out of the non-moe (mp_rank) state
+        #            dict -> it would never be saved. Shared experts are REPLICATED
+        #            (non-expert, param.allreduce untagged -> is_moe_param()==False), so
+        #            they belong in mp_rank_00_model_states.pt alongside attention/router.
+        #   AFTER:   match ONLY the precise routed-expert marker (the same prefix used by
+        #            the reorder/load code: '.deepspeed_moe.experts.deepspeed_experts.'),
+        #            so routed experts are popped (they live in layer_L_expert_E files),
+        #            while shared_experts and the router gate.wg stay in mp_rank.
+        # ===== END SHARED EXPERT =====
+        # NOTE (shared expert fix): marker has NO leading dot. These are full model
+        # keys (…mlp.deepspeed_moe.experts.deepspeed_experts.N…) so either form matches
+        # here, but we keep it dot-less to stay identical to the _save_moe_checkpoint
+        # site below, which tests module-relative keys that start with "deepspeed_moe".
         for key in list(full_state_dict.keys()):
-            if 'expert' in key and 'moe.gate.wg.weight' not in key:
+            if 'deepspeed_moe.experts.deepspeed_experts.' in key:
                 full_state_dict.pop(key)
 
         return full_state_dict
@@ -3363,8 +3381,26 @@ class DeepSpeedEngine(Module):
 
                 # get all moe parameters
                 moe_state_dict = {}
+                # ===== IMPLEMENTING SHARED EXPERT =====
+                #   Changed: the classifier that selects which params become per-expert
+                #            (layer_L_expert_E) checkpoint files.
+                #   BEFORE:  if 'expert' in n and 'moe.gate.wg.weight' not in n:
+                #   WHY:     the loose substring 'expert' ALSO matches 'shared_experts', so
+                #            the shared expert was mis-collected as a ROUTED expert. It then
+                #            failed the reorder regex below ('...deepspeed_experts.([0-9]+)...'),
+                #            giving local_expert_id=None -> int(None) -> TypeError (the crash).
+                #            Shared experts are replicated (non-expert) and must NOT be written
+                #            as per-expert files; they ride in mp_rank via _get_non_moe_state_dict.
+                #   AFTER:   collect ONLY true routed experts by the precise marker
+                #            '.deepspeed_moe.experts.deepspeed_experts.' (same string as
+                #            moe_str_prefix / the load path), so shared_experts and gate.wg
+                #            are skipped here.
+                # ===== END SHARED EXPERT =====
                 for n, p in module.state_dict().items():
-                    if 'expert' in n and 'moe.gate.wg.weight' not in n:
+                    # marker has NO leading dot: `n` is module-relative and starts with
+                    # "deepspeed_moe.experts.deepspeed_experts.N..." (no leading dot). A
+                    # leading-dot marker matches nothing here -> no expert files written.
+                    if 'deepspeed_moe.experts.deepspeed_experts.' in n:
                         moe_state_dict[n_module + '.' + n] = p
                 moe_str_prefix = '.deepspeed_moe.experts.deepspeed_experts.'
                 # print(moe_state_dict.keys()) # until now, everything is fine. So the bug happens at next few lines

@@ -2379,14 +2379,25 @@ class DeepSpeedEngine(Module):
             self._moe_router_bias_announced = True
             if self.global_rank == 0:
                 logger.info(f'[deepseek_v3] router bias step: {len(gates)} gates on this stage, speed {gates[0].bias_update_speed}, '
-                            f'loads summed over {dist.get_world_size(group=dp_group) if dp_group is not None else 1} data-parallel ranks; '
+                            f'loads summed over {dist.get_world_size(group=dp_group) if dp_group is not None else 1} data-parallel ranks '
+                            f'x {bwc_tensor_model_parallel_world_size(groups.mpu) if groups.mpu is not None else 1} tensor-parallel ranks; '
                             f'first gate max |bias| before this step {gates[0].expert_bias.abs().max().item():.6f} '
                             f'(0 from random init; a resumed run carries the saved bias)')
+        # Under tensor parallelism the gate's replicas each route their own token shard (the sequence-sharded MoE block, with or
+        # without Megatron's sequence parallelism), so the batch's loads are the sum over the data-parallel AND the tensor-parallel
+        # group; summed over the data-parallel group alone, each replica moved its bias by its own half of the batch and the
+        # replicas drifted apart (run A3, 2026-09-11: 116 of 1,664 update signs differed, the biases 0.002 apart after one step).
+        # With expert tensor parallelism the replicas see the same tokens and the sum over TP scales every load alike: harmless.
+        tp_group = bwc_tensor_model_parallel_group(groups.mpu) if groups.mpu is not None else None
+        if tp_group is not None and dist.get_world_size(group=tp_group) <= 1:
+            tp_group = None
         with torch.no_grad():
             for g in gates:
                 load = g.load_acc.clone()
                 if dp_group is not None and dist.get_world_size(group=dp_group) > 1:
                     dist.all_reduce(load, group=dp_group)
+                if tp_group is not None:
+                    dist.all_reduce(load, group=tp_group)
                 total = load.sum()
                 if total > 0:
                     g.expert_bias.add_(g.bias_update_speed * torch.sign(load.mean() - load))

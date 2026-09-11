@@ -155,7 +155,12 @@ def single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, asyn
     # we only need num_heads once
     num_heads = input.shape[2]
 
-    if get_num_kv_heads() is not None or num_heads % seq_world_size != 0:
+    # Divisibility only classifies the head-SCATTER direction (scatter_idx>=2),
+    # where shape[2] is the TOTAL head count. On the gather direction shape[2]
+    # is the local count (heads/sp), which is < sp for any sp**2 > heads and
+    # would misroute even configs into the uneven path. True uneven configs
+    # re-enter via the persistent get_num_kv_heads() flag set at entry.
+    if get_num_kv_heads() is not None or (num_heads % seq_world_size != 0 and scatter_idx >= 2):
         # Assuming here that the number of heads for q is consistent with kv
         # If not, additional logic is required for cases like GQA
         if get_num_kv_heads() is None:

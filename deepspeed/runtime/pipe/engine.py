@@ -296,6 +296,14 @@ class PipelineEngine(DeepSpeedEngine):
             if self.using_bf16_optimizer:
                 # PP+BF16 work for ZeRO Stage 1
                 self._bf16_reduce_grads()
+                # _bf16_reduce_grads() reduces only over data parallel groups;
+                # gate gradients sharded by the sequence-sharded MoE block must
+                # also be reduced over the tensor model parallel group. The
+                # allreduce_gradients() path below already does this internally.
+                self._allreduce_moe_gate_tp_grads()
+                # Likewise for norm gradients sharded by Megatron companion
+                # sequence parallelism (marked `sequence_parallel` params).
+                self._allreduce_sequence_parallel_grads()
             else:
                 self.allreduce_gradients(bucket_size=MEMORY_OPT_ALLREDUCE_SIZE)
         self._force_grad_boundary = False

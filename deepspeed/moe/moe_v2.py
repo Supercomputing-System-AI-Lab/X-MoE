@@ -246,15 +246,35 @@ class MOEv2Layer(Base):
             tensor_model_world_size = bwc_tensor_model_parallel_world_size(groups.mpu)
 
             # sequence-sharded MoE block: drop tokens at the beginning of the sparse MoE layer.
-            if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
+            moe_sequence_sharded = tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1
+            # Megatron TP-companion --sequence-parallel (XMOE_MEGATRON_SP=1,
+            # exported alongside the flag): the layer input is ALREADY this
+            # rank's sequence shard ([s/TP * b, d]), so narrowing again would
+            # keep chunk r OF shard r and the exit gather would rebuild the
+            # sequence out of other ranks' tokens (shapes still match --
+            # silent). Skip the entry narrow and the exit gather; the gate
+            # still sees a 1/TP token shard either way, so the l_aux / TP
+            # scaling below and the engine's gate TP grad sum stay keyed on
+            # moe_sequence_sharded exactly as landed.
+            megatron_sequence_parallel = moe_sequence_sharded and os.getenv('XMOE_MEGATRON_SP') == '1'
+            if moe_sequence_sharded and not megatron_sequence_parallel:
                 orig_shape = reshaped_input.shape
                 reshaped_input = drop_tokens(reshaped_input, dim=0)
                 assert reshaped_input.shape[0] == orig_shape[0] // tensor_model_world_size and reshaped_input.shape[1] == orig_shape[1]
 
             n_tokens = reshaped_input.shape[0]
-            
+
             if self.use_pft:
                 self.l_aux, indices, bin_ids, bins, expert_weights, input_splits_tensor = self.gate(reshaped_input, use_pft=True)
+                if moe_sequence_sharded:
+                    # The gate ran on a 1/TP token shard, so every TP rank
+                    # contributes its own shard-local l_aux to the loss and the
+                    # gate gradients are summed across the TP group. Scale by
+                    # 1/TP to keep the effective auxiliary loss at the TP=1
+                    # magnitude.
+                    self.l_aux = self.l_aux / tensor_model_world_size
+
+                
                 if self.wall_clock_breakdown:
                     torch.distributed.barrier()
                     self.timers(DISPATCH_TIMER).start()
@@ -272,6 +292,9 @@ class MOEv2Layer(Base):
                 self.exp_counts = input_splits_tensor
             else:
                 self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+                if moe_sequence_sharded:
+                    # Same 1/TP scale as the use_pft branch above.
+                    self.l_aux = self.l_aux / tensor_model_world_size
                 if self.wall_clock_breakdown:
                     torch.distributed.barrier()
                     self.timers(DISPATCH_TIMER).start()
@@ -409,7 +432,10 @@ class MOEv2Layer(Base):
                 self.time_combine = self.timers(COMBINE_TIMER).elapsed(reset=False)
 
             # sequence-sharded MoE block: gather tokens at the end of the sparse MoE layer.
-            if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
+            # (Skipped under Megatron companion sequence parallelism: the
+            # output must stay this rank's sequence shard -- see the entry
+            # guard above.)
+            if moe_sequence_sharded and not megatron_sequence_parallel:
                 combined_output = gather_tokens(combined_output, dim=0)
                 assert combined_output.shape == orig_shape
 

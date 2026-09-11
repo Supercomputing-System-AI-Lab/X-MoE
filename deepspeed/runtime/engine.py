@@ -66,6 +66,7 @@ from deepspeed.runtime.sparse_tensor import SparseTensor
 from deepspeed.runtime import lr_schedules
 from deepspeed.utils import groups
 from deepspeed.utils import logger, log_dist, instrument_w_nvtx
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_world_size, bwc_tensor_model_parallel_group
 from deepspeed.utils.timer import NoopTimer, ThroughputTimer, SynchronizedWallClockTimer, \
     FORWARD_MICRO_TIMER, BACKWARD_MICRO_TIMER, BACKWARD_INNER_MICRO_TIMER, BACKWARD_REDUCE_MICRO_TIMER, \
     STEP_MICRO_TIMER, \
@@ -144,6 +145,78 @@ def split_half_float_double_sparse(tensors):
         if dense_bucket:
             dense_tensor_buckets.append((dtype, dense_bucket))
     return sparse_tensor_buckets, dense_tensor_buckets
+
+
+def _tp_replicated_grads_for_reduction(engine, params, family):
+    """Gradient tensors for the replicated `params` that the optimizer will
+    actually consume at step(), in an order identical on every TP rank (a
+    requirement for the collective calls the TP hooks issue over them).
+
+    Module-level (not a method) so the hooks stay callable unbound on test
+    stubs; `engine` is the DeepSpeedEngine (or a stub carrying the read
+    attributes: optionally `optimizer`, plus warn-once storage).
+
+    Under ZeRO stage 1 (DeepSpeedZeroOptimizer with gradient partitioning
+    off) reduce_gradients() ends in
+    independent_gradient_partition_epilogue(), which snapshots the
+    DP-averaged gradients into optimizer.averaged_gradients and then frees
+    every param.grad (zero_grad(set_to_none=True), stage_1_and_2.py). The
+    TP hooks run after reduce_gradients, so reading param.grad there is a
+    silent no-op -- the defect that let every replicated param family
+    (norms, MoE gates) diverge across TP in the
+    lc128k-sp-turn1/global_step15 checkpoint. Reduce the partition-resident
+    slices in averaged_gradients instead: bit16 group flattening and DP
+    partition boundaries are identical on every TP rank (replicated params
+    are identical, TP-sharded params are equal-sized), so slice j of group
+    i covers the same elements of the same param on every TP rank, and the
+    TP-sum commutes with the DP average already applied. step() flattens
+    exactly these tensors.
+
+    Outside ZeRO (BF16_Optimizer / fp16 / fp32 wrappers) gradients survive
+    on the param: prefer the fp32 accumulation copy (_hp_grad), else .grad
+    -- the original behavior. If that path finds nothing for a non-empty
+    marked set, warn once: a silent skip here is exactly how the divergence
+    went unnoticed.
+    """
+    if not params:
+        return []
+    optimizer = getattr(engine, 'optimizer', None)
+    averaged = getattr(optimizer, 'averaged_gradients', None)
+    if averaged and any(g is not None for g in averaged.values()):
+        wanted = {id(p) for p in params}
+        grads = []
+        for i, part_params in enumerate(getattr(optimizer, 'params_in_partition', [])):
+            group_grads = averaged.get(i)
+            if not group_grads:
+                continue
+            # averaged_gradients[i] parallels params_in_partition[i]
+            # (get_flat_partition return_tensor_list=True); a trailing
+            # alignment pad, if any, is dropped by zip. Empty boundary
+            # slices are skipped identically on every TP rank.
+            for p, g in zip(part_params, group_grads):
+                if id(p) in wanted and g is not None and g.numel() > 0:
+                    grads.append(g)
+        return grads
+    grads = []
+    for param in params:
+        # BF16_Optimizer accumulates into the fp32 gradient copy; reduce
+        # that copy so the optimizer sees the reduced gradient (same
+        # handling as _exec_reduce_tied_grads).
+        grad = param._hp_grad if hasattr(param, '_hp_grad') else param.grad
+        if grad is not None:
+            grads.append(grad)
+    if not grads:
+        warned = getattr(engine, '_tp_replicated_grads_warned', None)
+        if warned is None:
+            warned = set()
+            engine._tp_replicated_grads_warned = warned
+        if family not in warned:
+            warned.add(family)
+            logger.warning(
+                f"{family} tensor parallel gradient reduction found no gradient tensors "
+                f"for {len(params)} replicated parameter(s) (no param.grad/_hp_grad and "
+                "no ZeRO averaged_gradients); their TP replicas may diverge.")
+    return grads
 
 
 class EngineTimers(object):
@@ -2054,6 +2127,94 @@ class DeepSpeedEngine(Module):
             else:
                 grads = None
                 self.buffered_allreduce_fallback(grads=grads, elements_per_buffer=bucket_size)
+            self._allreduce_moe_gate_tp_grads()
+            self._allreduce_sequence_parallel_grads()
+
+    def _allreduce_moe_gate_tp_grads(self):
+        """All-reduce MoE gate gradients across the tensor model parallel group.
+
+        The sequence-sharded MoE block (moe_v2.py) narrows the token dimension
+        across the tensor model parallel group before the gate runs, so each TP
+        replica of a gate accumulates gradient over a disjoint token shard.
+        Data parallel reduction never crosses TP ranks, so without this
+        reduction the replicated gate weights diverge. Summing (not averaging)
+        the shard gradients over the TP group reconstructs the full-batch gate
+        gradient and keeps the replicas bit-identical.
+
+        This is a no-op when there are no gate modules, when no mpu/TP group is
+        attached, at TP == 1, and when expert tensor parallelism is enabled
+        (the gate then sees the full batch; this mirrors the guard that enables
+        the sequence shard in moe_v2.py).
+        """
+        if not self.gate_modules:
+            return
+        if groups.mpu is None:
+            return
+        if bwc_tensor_model_parallel_world_size(groups.mpu) <= 1:
+            return
+        # Mirror the sequence-shard guard: with expert tensor parallelism the
+        # MoE block does not shard the sequence and the gate needs no reduction.
+        if groups._get_expert_model_parallel_world_size() != 1:
+            return
+        tp_group = bwc_tensor_model_parallel_group(groups.mpu)
+        if tp_group is None:
+            return
+        if self.zero_optimization_partition_gradients():
+            if not getattr(self, '_moe_gate_tp_grads_warned', False):
+                self._moe_gate_tp_grads_warned = True
+                logger.warning(
+                    "MoE gate tensor parallel gradient reduction is not supported with ZeRO gradient "
+                    "partitioning (stage >= 2); gate replicas may diverge across TP ranks.")
+            return
+        gate_params = [weight for gate in self.gate_modules for weight in gate.parameters()]
+        for grad in _tp_replicated_grads_for_reduction(self, gate_params, 'MoE gate'):
+            dist.all_reduce(grad, group=tp_group)
+
+    def _allreduce_sequence_parallel_grads(self):
+        """All-reduce sequence-parallel-marked gradients across the tensor
+        model parallel group.
+
+        Under Megatron's TP-companion sequence parallelism the layernorm /
+        rmsnorm activations are sharded seq-wise across the TP group, so each
+        TP replica of a norm weight accumulates gradient over a disjoint
+        sequence shard. Data parallel reduction never crosses TP ranks, and
+        Megatron's own allreduce_layernorm_grads path is unreachable under
+        DeepSpeed (megatron/training.py guards optimizer.reduce_model_grads
+        with `if not args.deepspeed`) -- the same unreachability, and the same
+        remedy, as _allreduce_moe_gate_tp_grads above. Summing (not averaging)
+        the shard gradients reconstructs the full-sequence gradient and keeps
+        the replicas identical.
+
+        Sweeps parameters carrying the `sequence_parallel` attribute:
+        megatron's fused LayerNorm marks its own weights; apex
+        MixedFusedRMSNorm weights are marked by the get_model sweep in
+        megatron/training.py. No-op when nothing is marked, when no mpu/TP
+        group is attached, and at TP == 1; warns and skips under ZeRO
+        gradient partitioning (stage >= 2), like the gate hook.
+        """
+        if groups.mpu is None:
+            return
+        if bwc_tensor_model_parallel_world_size(groups.mpu) <= 1:
+            return
+        params = getattr(self, '_sequence_parallel_params', None)
+        if params is None:
+            params = [param for param in self.module.parameters()
+                      if getattr(param, 'sequence_parallel', False)]
+            self._sequence_parallel_params = params
+        if not params:
+            return
+        tp_group = bwc_tensor_model_parallel_group(groups.mpu)
+        if tp_group is None:
+            return
+        if self.zero_optimization_partition_gradients():
+            if not getattr(self, '_sequence_parallel_grads_warned', False):
+                self._sequence_parallel_grads_warned = True
+                logger.warning(
+                    "Sequence-parallel gradient reduction is not supported with ZeRO gradient "
+                    "partitioning (stage >= 2); norm replicas may diverge across TP ranks.")
+            return
+        for grad in _tp_replicated_grads_for_reduction(self, params, 'Sequence-parallel'):
+            dist.all_reduce(grad, group=tp_group)
 
     @instrument_w_nvtx
     def backward(self, loss, allreduce_gradients=True, release_loss=False, retain_graph=False, scale_wrt_gas=True):

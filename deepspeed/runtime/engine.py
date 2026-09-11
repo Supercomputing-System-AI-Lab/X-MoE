@@ -2379,7 +2379,9 @@ class DeepSpeedEngine(Module):
             self._moe_router_bias_announced = True
             if self.global_rank == 0:
                 logger.info(f'[deepseek_v3] router bias step: {len(gates)} gates on this stage, speed {gates[0].bias_update_speed}, '
-                            f'loads summed over {dist.get_world_size(group=dp_group) if dp_group is not None else 1} data-parallel ranks')
+                            f'loads summed over {dist.get_world_size(group=dp_group) if dp_group is not None else 1} data-parallel ranks; '
+                            f'first gate max |bias| before this step {gates[0].expert_bias.abs().max().item():.6f} '
+                            f'(0 from random init; a resumed run carries the saved bias)')
         with torch.no_grad():
             for g in gates:
                 load = g.load_acc.clone()

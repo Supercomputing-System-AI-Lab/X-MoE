@@ -2401,8 +2401,12 @@ class DeepSpeedEngine(Module):
                 # https://nvidia.github.io/apex/advanced.html#gradient-clipping
                 master_params = amp.master_params(self.optimizer)
                 clip_grad_norm_(parameters=master_params, max_norm=self.gradient_clipping(), mpu=self.mpu)
+        # the gradient consistency probe (XMOE_GRAD_PROBE=N: the first N steps; off otherwise), xmoe_grad_probe.py
+        from deepspeed.runtime.xmoe_grad_probe import maybe_probe_before_step, maybe_probe_after_step
+        maybe_probe_before_step(self)
         self.optimizer.step()
         self._update_moe_router_bias()
+        maybe_probe_after_step(self)
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm

@@ -304,6 +304,9 @@ class PipelineEngine(DeepSpeedEngine):
                 # Likewise for norm gradients sharded by Megatron companion
                 # sequence parallelism (marked `sequence_parallel` params).
                 self._allreduce_sequence_parallel_grads()
+                # And the replicated dense parameters, averaged so the TP replicas stay bit-identical
+                # (engine._allreduce_tp_replicated_dense_grads, 2026-09-12).
+                self._allreduce_tp_replicated_dense_grads()
             else:
                 self.allreduce_gradients(bucket_size=MEMORY_OPT_ALLREDUCE_SIZE)
         self._force_grad_boundary = False

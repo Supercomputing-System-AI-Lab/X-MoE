@@ -2135,6 +2135,56 @@ class DeepSpeedEngine(Module):
                 self.buffered_allreduce_fallback(grads=grads, elements_per_buffer=bucket_size)
             self._allreduce_moe_gate_tp_grads()
             self._allreduce_sequence_parallel_grads()
+            self._allreduce_tp_replicated_dense_grads()
+
+    def _allreduce_tp_replicated_dense_grads(self):
+        """[X-MoE, 2026-09-12] Average over the tensor-parallel group the gradients of the parameters every TP rank
+        holds whole and computes from the whole batch: the norms, the latent attention's replicated projections
+        (q_a_proj, kv_a_proj_with_mqa), the final norm, the prediction head's and the indexer's replicated pieces.
+        Not the TP-sliced parameters (tensor_model_parallel), not the experts (each rank holds different ones), not the
+        gate (summed by _allreduce_moe_gate_tp_grads: under the sequence-sharded MoE block each replica sees one token
+        shard) and not the sequence_parallel-marked ones (summed by _allreduce_sequence_parallel_grads).
+
+        Why: on this machine the two TP ranks' copies of one computation are not bit-identical (arm B2s, 2026-09-11:
+        after one step from the same weights the exp_avg of every replicated dense family differed between the ranks
+        at 3.4e-3 to 8.8e-3 relative, 8 to 37 percent of the elements; the gate's, summed by its hook, at 0), so the
+        replicas drift by rounding noise at every step and the universal converter's bit-equality assert on replicated
+        slices fails (152 atoms of B2s). An all-reduce ends with the same bits on every rank, so the average keeps the
+        replicas identical by construction, and it is the value a deterministic machine computes. Same guards and the
+        same gradient source (the ZeRO-1 partition-resident averaged gradients) as the two hooks above.
+        """
+        if groups.mpu is None:
+            return
+        tp = bwc_tensor_model_parallel_world_size(groups.mpu)
+        if tp <= 1:
+            return
+        params = getattr(self, '_tp_replicated_dense_params', None)
+        if params is None:
+            summed = set()
+            if self.gate_modules and groups._get_expert_model_parallel_world_size() == 1:
+                summed = {id(w) for gate in self.gate_modules for w in gate.parameters()}
+            params = [p for p in self.module.parameters()
+                      if not getattr(p, 'tensor_model_parallel', False) and not is_moe_param(p)
+                      and not getattr(p, 'sequence_parallel', False) and id(p) not in summed]
+            self._tp_replicated_dense_params = params
+            if self.global_rank == 0:
+                logger.info(f"tensor-parallel replicated dense parameters averaged over TP {tp} after every step: "
+                            f"{len(params)} parameters, {sum(p.numel() for p in params)} elements")
+        if not params:
+            return
+        tp_group = bwc_tensor_model_parallel_group(groups.mpu)
+        if tp_group is None:
+            return
+        if self.zero_optimization_partition_gradients():
+            if not getattr(self, '_tp_replicated_dense_grads_warned', False):
+                self._tp_replicated_dense_grads_warned = True
+                logger.warning(
+                    "Tensor-parallel replicated dense gradient averaging is not supported with ZeRO gradient "
+                    "partitioning (stage >= 2); the replicas may drift apart across TP ranks.")
+            return
+        for grad in _tp_replicated_grads_for_reduction(self, params, 'Tensor-parallel replicated dense'):
+            dist.all_reduce(grad, group=tp_group)
+            grad.div_(tp)
 
     def _allreduce_moe_gate_tp_grads(self):
         """All-reduce MoE gate gradients across the tensor model parallel group.

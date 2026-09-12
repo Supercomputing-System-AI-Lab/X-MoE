@@ -253,6 +253,18 @@ def _probe(engine, k, n):
 
     # the router bias buffers
     gates = [m for m in engine.module.modules() if hasattr(m, 'expert_bias') and hasattr(m, 'load_acc')]
+    # XMOE_LOAD_DUMP=<dir>: the loads of this step (summed over dp x TP, the mover's input) per gate, and the bias, to a file per
+    # rank, so two layouts' loads can be compared token by token (the bias rule flips on a handful of tokens at the mean)
+    load_dir = os.getenv('XMOE_LOAD_DUMP')
+    if load_dir and gates:
+        os.makedirs(load_dir, exist_ok=True)
+        rec = {}
+        for gi, gm in enumerate(gates):
+            ld = _sum_over(gm.load_acc.detach().double().clone(), dp_group)
+            if tp > 1:
+                ld = _sum_over(ld, tp_group)
+            rec[gi] = dict(load=ld.cpu(), bias=gm.expert_bias.detach().double().cpu())
+        torch.save(rec, os.path.join(load_dir, f'loads_rank{rank}_step{k}.pt'))
     bias_dp = torch.zeros((), dtype=torch.float64, device=dev)
     bias_tp = torch.zeros((), dtype=torch.float64, device=dev)
     sign_diff = torch.zeros((), dtype=torch.float64, device=dev)

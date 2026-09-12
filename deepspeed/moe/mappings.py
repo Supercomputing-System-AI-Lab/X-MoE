@@ -37,17 +37,15 @@ def _gather_tokens(input_, dim=0):
     if world_size == 1:
         return input_
 
-    gather_buffer = torch.empty(world_size * input_.numel(), dtype=input_.dtype, device=input_.device)
+    # the buffer is the rank-0 concatenation of every rank's input (the same bytes as a flat buffer for NCCL; the gloo
+    # backend of the login-node tests checks that each rank's slot has the input's shape)
+    rows = input_.shape[0]
+    gather_buffer = torch.empty((world_size * rows, ) + tuple(input_.shape[1:]), dtype=input_.dtype, device=input_.device)
     deepspeed.comm.all_gather_into_tensor(gather_buffer, input_, group=bwc_tensor_model_parallel_group(mpu))
     if dim == 0:
-        shape = list(input_.size())
-        shape[0] = shape[0] * world_size
-        output = gather_buffer.view(shape)
+        output = gather_buffer
     else:
-        tensor_list = [
-            gather_buffer.narrow(0,
-                                 input_.numel() * i, input_.numel()).view_as(input_) for i in range(world_size)
-        ]
+        tensor_list = [gather_buffer.narrow(0, rows * i, rows) for i in range(world_size)]
         # Note: torch.cat already creates a contiguous tensor.
         output = torch.cat(tensor_list, dim=dim).contiguous()
 

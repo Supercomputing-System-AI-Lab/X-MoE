@@ -345,8 +345,18 @@ class MOEv2Layer(Base):
             # scaling below and the engine's gate TP grad sum stay keyed on
             # moe_sequence_sharded exactly as landed.
             megatron_sequence_parallel = moe_sequence_sharded and os.getenv('XMOE_MEGATRON_SP') == '1'
+            pad_rows = 0
             if moe_sequence_sharded and not megatron_sequence_parallel:
                 orig_shape = reshaped_input.shape
+                # [2026-09-12] a token count that TP does not divide (a decode step of a batch smaller than TP, the last batch of
+                # an evaluation; a training batch never takes this branch): pad with zero rows to the next multiple, shard, and
+                # cut the padding off after the exit gather. The padded rows route like any token and are discarded; the
+                # dispatch drops no real token, so the real rows are unchanged (tested on two gloo ranks).
+                rem = orig_shape[0] % tensor_model_world_size
+                if rem:
+                    pad_rows = tensor_model_world_size - rem
+                    reshaped_input = torch.cat([reshaped_input, reshaped_input.new_zeros(pad_rows, orig_shape[1])], dim=0)
+                    orig_shape = reshaped_input.shape
                 reshaped_input = drop_tokens(reshaped_input, dim=0)
                 assert reshaped_input.shape[0] == orig_shape[0] // tensor_model_world_size and reshaped_input.shape[1] == orig_shape[1]
 
@@ -528,8 +538,14 @@ class MOEv2Layer(Base):
             if moe_sequence_sharded and not megatron_sequence_parallel:
                 combined_output = gather_tokens(combined_output, dim=0)
                 assert combined_output.shape == orig_shape
+                if pad_rows:
+                    combined_output = combined_output[:-pad_rows]
 
             a = combined_output.reshape(input[0].shape)
+            
+            if (os.getenv ('DEBUG_ACTIVATION_OUTPUT') == 1): 
+                print (f'[moe_v2.py] AFTER COMBINE OUT {a.shape=} \n{a[0][:2]=}')
+
             
             if self.wall_clock_breakdown:
                 torch.distributed.barrier()

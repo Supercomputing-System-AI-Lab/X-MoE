@@ -102,7 +102,12 @@ class SubparamShape:
     partition_dim: int
 
 
-def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size):
+def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size, keys=None):
+    """Load this parameter's atoms from `folder` (zero/<name>/): fp32.pt into the fp32 master fragment, the optimizer
+    states (exp_avg.pt, ...) into optim_fragment, step.pt returned. `keys`, when given, names the atoms to read and the
+    others are left on disk: (FP32_WEIGHT_KEY,) is the weights-only load of Megatron's --finetune (base_optimizer,
+    load_optimizer_states=False), which takes the fp32 master weight -- the parameter's value in the universal format --
+    and nothing of the optimizer. [X-MoE, 2026-09-12]"""
     hp_mapping = self._hp_mapping
     hp_mapping.optim_fragment = {}
 
@@ -118,6 +123,8 @@ def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size):
         match = re.search(pattern, file)
         if match:
             hp_keys.append(match.group(1))
+    if keys is not None:
+        hp_keys = [k for k in hp_keys if k in keys]
 
     if timing:
         timing.row('folder',

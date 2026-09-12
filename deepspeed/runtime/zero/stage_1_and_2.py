@@ -2304,7 +2304,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights,
                                    param_name_aliases=None):
         self.load_hp_checkpoint_state_from_checkpoint_dir("bit16_groups", checkpoint_folder,
-                                                          param_name_aliases)
+                                                          param_name_aliases,
+                                                          load_optimizer_states=load_optimizer_states)
 
     @property
     def param_groups(self):

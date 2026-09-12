@@ -10,6 +10,7 @@ from deepspeed.utils import logger
 from deepspeed.utils.tensor_fragment import map_to_flat_opt_states
 from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank
 from deepspeed.checkpoint.utils import load_checkpoint_file
+from deepspeed.checkpoint.constants import FP32_WEIGHT_KEY
 from deepspeed.checkpoint.universal_checkpoint import universal_load_timing
 
 
@@ -47,10 +48,50 @@ class ZeROOptimizer(DeepSpeedOptimizer):
                 return alt
         return folder
 
+    def _universal_tp_rank_and_size(self):
+        tp_rank = bwc_tensor_model_parallel_rank(mpu=self.mpu)
+        if self.mpu is None:
+            logger.warn("MPU is not provided, setting tp size to 1 in checkpoint loading.")
+            tp_world_size = 1
+        else:
+            tp_world_size = self.mpu.get_slice_parallel_world_size() if hasattr(self.mpu, "get_slice_parallel_world_size") \
+                else self.mpu.get_tensor_model_parallel_world_size()
+        return tp_rank, tp_world_size
+
+    def _load_hp_weights_only(self, lp_groups_name, zero_dir, param_name_aliases):
+        """[X-MoE, 2026-09-12] The weights-only universal load (load_optimizer_states=False): every parameter's fp32.pt
+        atom into its fp32 master fragment, nothing else read or restored (see load_hp_checkpoint_state_from_checkpoint_dir)."""
+        tp_rank, tp_world_size = self._universal_tp_rank_and_size()
+        loaded = 0
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            for lp in getattr(self, lp_groups_name)[i]:
+                if lp._hp_mapping is None:
+                    continue
+                folder = self._hp_param_folder(zero_dir, self.param_names[lp], param_name_aliases)
+                lp.load_hp_checkpoint_state(folder, tp_rank, tp_world_size, keys=(FP32_WEIGHT_KEY,))
+                loaded += 1
+        logger.info(f'universal checkpoint {zero_dir}: loaded the fp32 master weights of {loaded} parameters and nothing '
+                    f'of the optimizer (load_optimizer_states=False: the moments, the step and the parameter groups\' '
+                    f'hyper-parameters stay as this run built them)')
+
     def load_hp_checkpoint_state_from_checkpoint_dir(self,
                                                      lp_groups_name: str,
                                                      checkpoint_dir: str,
-                                                     param_name_aliases=None) -> None:
+                                                     param_name_aliases=None,
+                                                     load_optimizer_states: bool = True) -> None:
+        """Load this rank's fragments of every parameter from the universal checkpoint's atoms (zero/<name>/).
+
+        [X-MoE, 2026-09-12] load_optimizer_states=False (Megatron's --finetune: engine.load_checkpoint with
+        load_module_only=True) is the weights-only load: each parameter's fp32.pt atom -- the parameter's value in the
+        universal format, the fp32 master weight (Universal Checkpointing, Lian et al. 2024-06, section 5.2: model.pt,
+        "a fp32 tensor represents parameter's weight"; the optimizer states are the other two atoms) -- is copied into the
+        fp32 partition, so the masters are exact instead of rebuilt from the bf16 module weights; the moments (exp_avg,
+        exp_avg_sq), the step and the parameter groups' hyper-parameters (lr, betas, weight decay, step) stay as this run
+        built them, and zero/optimizer_state.pt is not required. Before this the universal path ignored the flag and
+        restored all of it: arm B1s (2026-09-11, the source's own layout, so the positional group restore applied) took its
+        first step at the source checkpoint's learning rate 1.03e-5 with its step count 61 instead of the warm-up's 0, and
+        its fp32 masters moved 1.2e-3 relative in that one step; arm B2s at a changed layout (13 groups against the
+        source's 8, the restore skipped) took the rate-0 step and kept them exactly."""
         # Per-rank timing, enabled by UCP_LOAD_TIMING_DIR (see deepspeed.checkpoint.universal_checkpoint).
         timing = universal_load_timing()
         if timing:
@@ -58,6 +99,9 @@ class ZeROOptimizer(DeepSpeedOptimizer):
             timing.n_bytes = 0
             t_bracket0 = time.perf_counter_ns()
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
+        if not load_optimizer_states:
+            self._load_hp_weights_only(lp_groups_name, checkpoint_dir, param_name_aliases)
+            return
         optim_state_path = os.path.join(checkpoint_dir, "optimizer_state.pt")
         assert os.path.isfile(
             optim_state_path), f'{optim_state_path} containing optimizer global state is missing! Cannot proceed.'
@@ -70,13 +114,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
 
         self._load_global_state(optim_sd)
 
-        tp_rank = bwc_tensor_model_parallel_rank(mpu=self.mpu)
-        if self.mpu is None:
-            logger.warn("MPU is not provided, setting tp size to 1 in checkpoint loading.")
-            tp_world_size = 1
-        else:
-            tp_world_size = self.mpu.get_slice_parallel_world_size() if hasattr(self.mpu, "get_slice_parallel_world_size") \
-                else self.mpu.get_tensor_model_parallel_world_size()
+        tp_rank, tp_world_size = self._universal_tp_rank_and_size()
 
         # How many parameter groups a rank builds is not a property of the model alone.
         # deepspeed.moe.utils chunks expert parameters into groups bounded by a maximum

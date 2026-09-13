@@ -1652,7 +1652,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         else:
             dist.all_reduce(tensor=tensor, op=op, group=self.model_parallel_group)
 
-    def get_grad_norm_direct(self, gradients, params, norm_type=2):
+    def get_grad_norm_direct(self, gradients, params, norm_type=2, model_parallel_reduce=True):
         """Clips gradient norm of an iterable of parameters.
 
         This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -1668,6 +1668,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         Returns:
             Total norm of the parameters (viewed as a single vector).
+
+        model_parallel_reduce=False leaves the model-parallel (cross-stage) reduction and the inf/nan marking to the
+        caller: the returned value is then this rank's norm reduced over its data-parallel group only, and the caller
+        combines the groups and reduces once (scaled_global_norm). Why: the model-parallel group spans the pipeline
+        stages, every stage must issue the same number of collectives on it, and the number of parameter groups is not
+        the same on every stage (a stage holding only dense layers has no expert group: the 671B at PP 32, run P64 of
+        2026-09-13, stage 0 finished its step while 31 stages waited in this function for the wall).
         """
         norm_type = float(norm_type)
         all_norms = []
@@ -1678,7 +1685,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=self.dp_process_group)
 
             # Take max across all GPUs.
-            self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.MAX)
+            if model_parallel_reduce:
+                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.MAX)
         else:
             # if dist.get_rank() == 0:
             #    logger.info(f"Total Norm beginning {total_norm}")
@@ -1701,9 +1709,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # Sum across all model parallel Device.
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=self.dp_process_group)
 
-            self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
+            if model_parallel_reduce:
+                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
 
             total_norm = total_norm.pow(1. / norm_type)
+
+        if not model_parallel_reduce:
+            return total_norm
 
         norm_is_inf = total_norm.isinf()
         norm_is_nan = total_norm.isnan()
@@ -1791,13 +1803,23 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                     device=self.device)
                 norm_groups.append(norm)
             else:
-                norm_groups.append(self.get_grad_norm_direct(self.averaged_gradients[i], self.params_in_partition[i]))
+                # the model-parallel (cross-stage) reduction is done once below, not once per group: the stages of a
+                # pipeline do not all have the same number of parameter groups (see get_grad_norm_direct)
+                norm_groups.append(self.get_grad_norm_direct(self.averaged_gradients[i], self.params_in_partition[i],
+                                                             model_parallel_reduce=False))
 
         if self.has_moe_layers:
             self._average_expert_grad_norms(norm_groups)
 
         # calculating L2 norm
-        return torch.norm(torch.stack(norm_groups), p=norm_type)
+        if self.cpu_offload:
+            return torch.norm(torch.stack(norm_groups), p=norm_type)
+        total_sq = torch.stack(norm_groups).square().sum().float()
+        self._model_parallel_all_reduce(tensor=total_sq, op=dist.ReduceOp.SUM)     # one collective on every stage
+        total_norm = total_sq.sqrt()
+        inf_or_nan = total_norm.isnan().logical_or(total_norm.isinf())
+        err = torch.tensor(-1.0, device=self.device, dtype=torch.float)
+        return inf_or_nan * err + inf_or_nan.logical_not() * total_norm
 
     def get_bit16_param_group(self, group_no):
         bit16_partitions = self.parallel_partitioned_bit16_groups[group_no]

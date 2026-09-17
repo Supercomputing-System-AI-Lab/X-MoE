@@ -2809,8 +2809,11 @@ class DeepSpeedEngine(Module):
     def _reduce_non_expert_gradients(self, grads, elements_per_buffer):
         split_sparse_tensor_buckets, split_dense_tensor_buckets = split_half_float_double_sparse(grads)
         if self.pipeline_parallelism:
+            # [X-MoE 2026-09-17, the Ulysses blueprint C8] the grid's data axis is dp x P (gpt_model.py builds the topology so) and the
+            # grid reports the sequence size (the fork attaches the accessors): the sum over the P sequence ranks, the average over dp,
+            # as the branch below does without a pipeline. With P = 1 nothing changes.
             dp_group = self.mpu.get_data_parallel_group()
-            dp_world_size = dist.get_world_size(dp_group)
+            dp_world_size = dist.get_world_size(dp_group) / float(self.sequence_parallel_size)
         else:
             dp_group = groups._get_sequence_data_parallel_group()
             dp_world_size = dist.get_world_size(dp_group) / float(self.sequence_parallel_size)
@@ -2831,6 +2834,9 @@ class DeepSpeedEngine(Module):
         # to maintain the gradients value unaffected by ep_size setting,
         # utilize dp_world_size for allreduce average
         dp_world_size = dist.get_world_size(groups._get_data_parallel_group())
+        if self.pipeline_parallelism:
+            # [X-MoE 2026-09-17, C8] under the pipe the data group is the grid's (dp x P); without one it excludes P already
+            dp_world_size = dp_world_size / float(self.sequence_parallel_size)
         for ep_name, expert_grads_group in expert_grads.items():
             ep_dp_group = groups._get_expert_data_parallel_group(ep_name)
             split_sparse_tensor_buckets, split_dense_tensor_buckets = split_half_float_double_sparse(

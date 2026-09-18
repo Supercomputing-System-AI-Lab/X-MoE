@@ -635,11 +635,6 @@ def topkgating(
             tp = 1 if groups.mpu is None else bwc_tensor_model_parallel_world_size(mpu=groups.mpu)
             new_capacity = torch.ceil(new_capacity / tp).mul(tp).to(new_capacity.dtype)
         capacity = new_capacity
-        # [X-MoE 2026-09-18] the dropless branch never assigned `locations` (the position of every token inside its
-        # expert's list), which the dispatch mask below needs; every dropless run of this gate (the grouped-GEMM expert
-        # classes under --disable-moe-token-dropping) died with UnboundLocalError at the first MoE forward (job 5504024).
-        # Nothing is dropped: the capacity is the largest expert count, so every location is inside it.
-        locations = torch.cumsum(mask, dim=0) - 1
 
     # normalize gates
     gates_masked = gates * mask

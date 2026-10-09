@@ -863,7 +863,7 @@ class PipelineEngine(DeepSpeedEngine):
         if self.using_bf16_optimizer and not self.is_last_stage():
             # manually call because we don't call optimizer.backward()
             self.optimizer.clear_lp_grads()
-
+                
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
             out_tensors = [t for t in outputs if t.is_floating_point()]
@@ -1420,6 +1420,15 @@ class PipelineEngine(DeepSpeedEngine):
         # Reserve and reset buffers.
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
         self.fwd_outputs = []
+        
+        # Print the schedule for the current rank
+        # if self.global_rank == 0:  # Or any rank you want to inspect
+        # print(f"----------- Schedule for Rank-{self.global_rank} for  -----------", flush=True)
+        # for step_idx, step_cmds in enumerate(pipe_schedule):
+        #     print(f"  Step {step_idx}:", flush=True)
+        #     for cmd in step_cmds:
+        #         print(f"    {cmd}", flush=True)
+        # print("----------------------------------------------------", flush=True)
 
         # For each step in the schedule
         for step_cmds in pipe_schedule:
@@ -1431,6 +1440,10 @@ class PipelineEngine(DeepSpeedEngine):
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
                 self._exec_instr(**cmd.kwargs)
+                # the torch profiler's micro-batch window (2026-09-13): Megatron's train() sets _xmoe_micro_step when
+                # PROFILE_MICROBATCHES=1; it runs after every backward pass, so a profiler schedule counts micro-batches
+                if type(cmd) is schedule.BackwardPass and getattr(self, '_xmoe_micro_step', None) is not None:
+                    self._xmoe_micro_step()
 
     def get_additional_losses(self):
         return self.agg_additional_losses

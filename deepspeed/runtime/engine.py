@@ -3439,6 +3439,16 @@ class DeepSpeedEngine(Module):
             return
         zero_dir = os.path.join(checkpoint_folder, 'zero')
         missing = [n for n in names if not os.path.isfile(os.path.join(zero_dir, n, 'buffer.pt'))]
+        if missing and os.environ.get('XMOE_UCP_ALLOW_MISSING_BUFFERS') == '1':
+            # [X-MoE, 2026-10-01] a buffer the save did not carry has no atom: the DeepSeek-MoE-16B saves of August list the rotary
+            # inv_freq in buffer_names but hold no value for it (non-persistent at save time), and it is rebuilt from the run's own
+            # rotary base at init, which is the value a stage transition wants. With the flag the model keeps its built value.
+            logger.warning(f'[universal] {len(missing)} of {len(names)} persistent buffers have no atom in {checkpoint_folder} and are '
+                           f'kept at their initial value (XMOE_UCP_ALLOW_MISSING_BUFFERS=1): {missing}')
+            names = [n for n in names if n not in missing]
+            missing = []
+            if not names:
+                return
         if missing:
             raise RuntimeError(f'universal checkpoint {checkpoint_folder} has no buffer atom for {len(missing)} of the '
                                f'{len(names)} persistent buffers of this model (e.g. zero/{missing[0]}/buffer.pt): it was '

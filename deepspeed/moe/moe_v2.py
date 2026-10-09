@@ -6,6 +6,7 @@ from typing import Callable, Dict, TYPE_CHECKING, Any, Optional, Tuple, Union
 import os
 import sys
 import torch
+from deepspeed.moe import route_log   # the routing record (2026-10-06): per-expert token counts per micro-batch, on under XMOE_ROUTE_LOG=1
 from torch import Tensor
 from torch.nn import Module
 import torch.nn.functional as F
@@ -204,6 +205,11 @@ class TopKGatev2(Module):
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
         self.top2_2nd_expert_sampling = top2_2nd_expert_sampling
+        # the routing record (2026-10-06): when XMOE_ROUTE_LOG=1 this gate keeps its per-expert token count of every micro-batch for
+        # deepspeed/moe/route_log.py (flushed once per step by Megatron's train loop); off by default, nothing else changes
+        self._route_on = route_log.enabled()
+        if self._route_on:
+            route_log.register(self)
 
     def _set_ep_group(self, ep_group):
         assert self.ep_group is None, f'Attempting to override an existing ep_group'
@@ -246,6 +252,8 @@ class TopKGatev2(Module):
                                 norm_topk_prob=self.norm_topk_prob,
                                 routed_scaling_factor=self.routed_scaling_factor,
                                 seq_aux=self.seq_aux, n_sequences=n_sequences)
+        if getattr(self, '_route_on', False) and self.training:
+            route_log.record(self, gate_output[5])   # the routing record: this micro-batch's per-expert token count (before any capacity drop)
         if self.bias_update_speed > 0.0 and self.training:
             # the tokens each expert received in this micro-batch (the 6th return, tokens_per_expert), summed until the step
             with torch.no_grad():
@@ -316,8 +324,9 @@ class MOEv2Layer(Base):
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
 
-        # print (f'inside moe forward')
-        import os
+        if (os.getenv ('DEBUG_ACTIVATION_OUTPUT') == 1): 
+            print (f'[moe_v2.py] BEFORE ROUTER {input[0].shape=}\n{input[0][:2][:30]=}')
+        
         rank = os.getenv ('RANK')
         self.wall_clock_breakdown = os.getenv ("WALL_CLOCK_BREAKDOWN")=="true"
         # self.wall_clock_breakdown = False
@@ -374,6 +383,8 @@ class MOEv2Layer(Base):
                     # magnitude.
                     self.l_aux = self.l_aux / tensor_model_world_size
 
+                if (os.getenv ('DEBUG_ACTIVATION_OUTPUT') == 1): 
+                    print (f'[moe_v2.py] AFTER GATE {bin_ids.shape=}\n{bin_ids=}')
                 
                 if self.wall_clock_breakdown:
                     torch.distributed.barrier()
@@ -443,9 +454,13 @@ class MOEv2Layer(Base):
             # expert_output_uneven = self.experts(dispatched_output, splits)
 
             ##################
-            # print (f'[moe_v2.py] BEFORE EXPERT {dispatched_output.shape=}')
+            if (os.getenv ('DEBUG_ACTIVATION_OUTPUT') == 1): 
+                print (f'[moe_v2.py] BEFORE EXPERT {dispatched_output.shape=}\n{dispatched_output[0][:2][:30]=}')
+            
             expert_output_uneven = self.experts(dispatched_output, output_splits_tensor)
-            # print (f'[moe_v2.py] AFTER EXPERT {expert_output_uneven.shape=}')
+            
+            if (os.getenv ('DEBUG_ACTIVATION_OUTPUT') == 1): 
+                print (f'[moe_v2.py] AFTER EXPERT {expert_output_uneven.shape=}\n{expert_output_uneven[0][:2][:30]=}')
         
             from .experts import FusedExperts_Triton   # its kernel stores each output row at its input index: rows already rank-major
             # the per-expert loop (Experts) and FusedExperts_Primus return rows expert-major: reorder them to rank-major for the combine

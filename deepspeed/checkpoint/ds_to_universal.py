@@ -159,6 +159,19 @@ def parse_arguments():
         help='[X-MoE, 2026-09-07, proposal C10] Each merge worker hands its atom writes (torch.save) to a writer '
         'thread with a queue of one, so the next tensor\'s fragment reads run while the previous tensor\'s three '
         'atoms drain. Same files, same contents; the merge task then measures reads + joins only.')
+    parser.add_argument(
+        '--param-shard', type=str, default=None,
+        help='[X-MoE, 2026-10-07] K/N (K from 0): this run merges every N-th parameter of the merge list starting at K, so '
+             'that N single-node jobs convert one checkpoint in parallel into one output folder (a 671B ZeRO save is 8.7 TB, '
+             'more than one node converts under a 2-hour wall). Each run indexes the shards into its own tmp_<K>/, writes '
+             'shards/merge_<K>_of_<N>.done after its share, and the run that finds all N markers (shards/finalize.lock, an '
+             'atomic directory, elects one) writes the buffers, the common optimizer states, the model-state copies and '
+             'latest_universal; the others exit after their share. Implies --resume-atoms.')
+    parser.add_argument(
+        '--resume-atoms', action='store_true',
+        help='[X-MoE, 2026-10-07] skip a parameter whose atoms an earlier run wrote completely (the marker '
+             'shards/atoms/<name>.done under the output folder, written after the last atom of the parameter; a run '
+             'killed mid-write leaves none), so that a conversion continues across jobs. Not with --merge-writer-thread.')
     parser.add_argument('--num_extract_workers',
                         default=4,
                         type=int,
@@ -962,6 +975,21 @@ _MERGE_WRITER_THREAD = False   # set by _merge_tp_slice_files before the merge p
 _WRITER_MARK_DIR = None        # the temporary folder, for the failure markers
 _WRITER = None                 # per worker process: (thread, queue)
 _WRITER_ERROR = None
+_PARAM_SHARD = None    # [X-MoE, 2026-10-07] (K, N) from --param-shard; set in main before the pools fork, inherited by the workers
+_RESUME_ATOMS = False  # [X-MoE, 2026-10-07] --resume-atoms, or any --param-shard
+
+
+def _merge_resumable(do_work, marks_dir, item):
+    """[X-MoE, 2026-10-07] --resume-atoms: merge one parameter unless its marker says an earlier run finished it, and write
+    the marker after its atoms (synchronous writes only, so a run killed mid-write leaves no marker). The markers live in
+    <output>/shards/atoms/<name>.done, outside zero/<name>/, which the universal loader lists (universal_checkpoint.py:120)."""
+    mark = os.path.join(marks_dir, item[0] + '.done')
+    if os.path.exists(mark):
+        return set()
+    result = do_work(item)
+    with open(mark, 'w') as f:
+        f.write('1\n')
+    return result
 
 
 def _writer_loop(q):
@@ -1237,7 +1265,20 @@ def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
     if getattr(args, 'merge_writer_thread', False):   # [X-MoE, 2026-09-07] C10
         _MERGE_WRITER_THREAD, _WRITER_MARK_DIR = True, temp_dir
         print('*** merge writer thread: each merge worker writes its atoms from a thread with a queue of one')
-    unmatched_patterns_lists = _do_parallel_work(do_work, list(slice_shapes.items()), args.num_merge_workers)
+    items = list(slice_shapes.items())
+    if _PARAM_SHARD:   # [X-MoE, 2026-10-07] this run's share of the parameters
+        k, n = _PARAM_SHARD
+        items = items[k::n]
+        print(f'*** --param-shard {k}/{n}: {len(items)} of {len(slice_shapes)} parameters in this run')
+    if _RESUME_ATOMS:   # [X-MoE, 2026-10-07]
+        if getattr(args, 'merge_writer_thread', False):
+            raise RuntimeError('--resume-atoms needs synchronous atom writes; drop --merge-writer-thread')
+        marks_dir = os.path.join(args.output_folder, 'shards', 'atoms')
+        os.makedirs(marks_dir, exist_ok=True)
+        n_done = sum(1 for name, _ in items if os.path.exists(os.path.join(marks_dir, name + '.done')))
+        print(f'*** --resume-atoms: {n_done} of {len(items)} parameters already complete from an earlier run, skipped')
+        do_work = partial(_merge_resumable, do_work, marks_dir)
+    unmatched_patterns_lists = _do_parallel_work(do_work, items, args.num_merge_workers)
     if _MERGE_WRITER_THREAD:   # [X-MoE, 2026-09-07] C10: the pool has joined its workers, and each worker its writer thread
         marks = glob.glob(os.path.join(temp_dir, 'WRITER_ERROR_*'))
         if marks:
@@ -1247,7 +1288,7 @@ def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
     # if a pattern was not used by any of the workers, then it was not used at all -> assert/alert
     sets = [set(lst) for lst in unmatched_patterns_lists]
     unmatched_patterns = list(set.intersection(*sets))
-    if args.strict:
+    if args.strict and not _PARAM_SHARD:   # [X-MoE, 2026-10-07] a sharded run sees only its share of the patterns
         assert not unmatched_patterns, f'Unused patterns={unmatched_patterns} while merging tp slices'
     elif unmatched_patterns:
         print(f'Warning: Unused patterns={unmatched_patterns} while merging tp slices')
@@ -1296,12 +1337,23 @@ def extract_buffers(args, ds_checkpoint):
                 path = os.path.join(ds_checkpoint.dir, f'layer_{int(m.group(1)):02d}-model_{tp_index:02d}-model_states.pt')
                 values.append(load_checkpoint_file(path)[m.group(2)])
             else:
-                values.append(load_checkpoint_file(ds_checkpoint.mp_rank_files[tp_index])['module'][name])
+                module_sd = load_checkpoint_file(ds_checkpoint.mp_rank_files[tp_index])['module']
+                if name not in module_sd:
+                    # [X-MoE, 2026-10-01] a save lists every buffer in buffer_names, but a non-persistent one (the rotary inv_freq of the
+                    # DeepSeek-MoE-16B saves of August) is absent from the module state: nothing to carry, it is rebuilt at init. Skipped.
+                    print(f'[extract_buffers] {name}: listed in buffer_names but absent from the module state of '
+                          f'{os.path.basename(ds_checkpoint.mp_rank_files[tp_index])} (a non-persistent buffer): skipped')
+                    values = []
+                    break
+                values.append(module_sd[name])
+        if not values:
+            continue
         for other in values[1:]:
             assert torch.equal(values[0], other), \
                 f'buffer {name} differs between tensor-parallel ranks; a buffer is replicated by construction'
         _save_checkpoint(os.path.join(args.output_folder, 'zero', name, 'buffer.pt'), {'buffer': values[0].cpu()})
-    return len(names)
+        written = written + 1 if 'written' in dir() else 1
+    return written if 'written' in dir() else 0
 
 
 def _save_optimizer_state(args, ds_checkpoint):
@@ -1404,6 +1456,13 @@ def _check_for_required_state(ds_checkpoint):
 
 def main(args):
     print(f'Convert DeepSpeed Checkpoint to Universal Checkpoint')
+    global _PARAM_SHARD, _RESUME_ATOMS   # [X-MoE, 2026-10-07]
+    if getattr(args, 'param_shard', None):
+        k, n = (int(x) for x in str(args.param_shard).split('/'))
+        if not (0 <= k < n):
+            raise ValueError(f'--param-shard {args.param_shard}: K must be in [0, N)')
+        _PARAM_SHARD = (k, n)
+    _RESUME_ATOMS = bool(getattr(args, 'resume_atoms', False)) or _PARAM_SHARD is not None
 
     print(f'Converting DeepSpeed checkpoint in {args.input_folder} to Universal checkpoint in {args.output_folder}')
 
@@ -1469,7 +1528,7 @@ def main(args):
             n_expert = sum(1 for k in slice_shapes if is_expert_param_name(k))
             print(f'*** MoE checkpoint: {n_expert} expert parameters across '
                   f"{moe_info.get('ep_size')} expert-parallel ranks")
-        temp_dir = os.path.join(args.output_folder, 'tmp')
+        temp_dir = os.path.join(args.output_folder, 'tmp' if not _PARAM_SHARD else f'tmp_{_PARAM_SHARD[0]}')   # [X-MoE, 2026-10-07]
 
         if _TIMING:
             t_ph, t_ph_abs = _timing_phase_end('startup', _TIMING_T0_NS, _TIMING_T0_ABS)
@@ -1483,6 +1542,24 @@ def main(args):
         if _TIMING:
             t_ph, t_ph_abs = _timing_phase_end('merge', t_ph, t_ph_abs)
 
+        if _PARAM_SHARD:   # [X-MoE, 2026-10-07] one run of N: mark this share; finalize only when every share is marked
+            k, n = _PARAM_SHARD
+            marks = os.path.join(args.output_folder, 'shards')
+            os.makedirs(marks, exist_ok=True)
+            if not args.keep_temp_folder:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            with open(os.path.join(marks, f'merge_{k}_of_{n}.done'), 'w') as f:
+                f.write(time.strftime('%Y-%m-%d %H:%M:%S\n'))
+            missing = [j for j in range(n) if not os.path.exists(os.path.join(marks, f'merge_{j}_of_{n}.done'))]
+            if missing:
+                print(f'*** --param-shard {k}/{n}: share complete; shares {missing} not complete yet; the last one finalizes')
+                return
+            try:
+                os.mkdir(os.path.join(marks, 'finalize.lock'))
+            except FileExistsError:
+                print(f'*** --param-shard {k}/{n}: every share complete, and another run holds the finalize lock')
+                return
+            print(f'*** --param-shard {k}/{n}: every share complete; this run finalizes')
         n_buffers = extract_buffers(args, ds_checkpoint)   # [X-MoE, 2026-09-11] the persistent buffers as atoms
         if n_buffers:
             print(f'*** 2b. {n_buffers} persistent buffer(s) written as atoms (zero/<name>/buffer.pt)')

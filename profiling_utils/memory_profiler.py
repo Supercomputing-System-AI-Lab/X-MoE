@@ -150,7 +150,7 @@ def init_memory_logger(work_dir=None):
 
 
 def log_memory(event, layer_num="N/A"):
-    if layer_num == 'N/A' or (layer_num % 4 ==0): 
+    if layer_num == 'N/A' or ((layer_num+1) % 2 ==0): 
         MemoryLogger.get_instance().log(event=event, layer=layer_num)
 
 def set_step(step_num):

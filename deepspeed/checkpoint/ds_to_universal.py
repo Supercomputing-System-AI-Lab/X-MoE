@@ -168,6 +168,12 @@ def parse_arguments():
              'atomic directory, elects one) writes the buffers, the common optimizer states, the model-state copies and '
              'latest_universal; the others exit after their share. Implies --resume-atoms.')
     parser.add_argument(
+        '--param-shard-balanced', action='store_true',
+        help='[X-MoE, 2026-10-10] with --param-shard K/N: instead of every N-th parameter of the merge list, the parameters are '
+             'ordered by size (the element count of their slice shape, largest first) and dealt greedily to the least-loaded share, '
+             'so that the N shares carry about the same number of bytes and finish together (the UCP worker duty of the resilient '
+             'job runs one share per worker node). Deterministic: every share computes the same assignment from the same list.')
+    parser.add_argument(
         '--resume-atoms', action='store_true',
         help='[X-MoE, 2026-10-07] skip a parameter whose atoms an earlier run wrote completely (the marker '
              'shards/atoms/<name>.done under the output folder, written after the last atom of the parameter; a run '
@@ -976,6 +982,24 @@ _WRITER_MARK_DIR = None        # the temporary folder, for the failure markers
 _WRITER = None                 # per worker process: (thread, queue)
 _WRITER_ERROR = None
 _PARAM_SHARD = None    # [X-MoE, 2026-10-07] (K, N) from --param-shard; set in main before the pools fork, inherited by the workers
+_PARAM_SHARD_BALANCED = False   # [X-MoE, 2026-10-10] --param-shard-balanced: the shares are dealt by size, not by position
+
+
+def balanced_shares(items, n):
+    """[X-MoE, 2026-10-10] Deal (name, shape) items into n shares of about equal byte count: largest first, each to the share with
+    the smallest total so far (ties to the lowest share index). Returns a list of n lists in the original order of the items, so
+    that a share's merge order is the merge list's order. The element count of the shape stands for the bytes (every parameter of a
+    checkpoint has the same dtype set in its atoms)."""
+    import math
+    sizes = [(math.prod(shape) if shape else 1, i) for i, (name, shape) in enumerate(items)]
+    sizes.sort(key=lambda t: (-t[0], t[1]))
+    load = [0] * n
+    owner = [0] * len(items)
+    for sz, i in sizes:
+        k = min(range(n), key=lambda j: (load[j], j))
+        owner[i] = k
+        load[k] += sz
+    return [[items[i] for i in range(len(items)) if owner[i] == k] for k in range(n)], load
 _RESUME_ATOMS = False  # [X-MoE, 2026-10-07] --resume-atoms, or any --param-shard
 
 
@@ -1268,8 +1292,14 @@ def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
     items = list(slice_shapes.items())
     if _PARAM_SHARD:   # [X-MoE, 2026-10-07] this run's share of the parameters
         k, n = _PARAM_SHARD
-        items = items[k::n]
-        print(f'*** --param-shard {k}/{n}: {len(items)} of {len(slice_shapes)} parameters in this run')
+        if _PARAM_SHARD_BALANCED:   # [X-MoE, 2026-10-10] the shares dealt by size so that they finish together
+            shares, load = balanced_shares(items, n)
+            items = shares[k]
+            print(f'*** --param-shard {k}/{n} (balanced by size): {len(items)} of {len(slice_shapes)} parameters in this run, '
+                  f'{load[k]:,} elements; the shares carry {", ".join(f"{x:,}" for x in load)} elements')
+        else:
+            items = items[k::n]
+            print(f'*** --param-shard {k}/{n}: {len(items)} of {len(slice_shapes)} parameters in this run')
     if _RESUME_ATOMS:   # [X-MoE, 2026-10-07]
         if getattr(args, 'merge_writer_thread', False):
             raise RuntimeError('--resume-atoms needs synchronous atom writes; drop --merge-writer-thread')
@@ -1456,12 +1486,13 @@ def _check_for_required_state(ds_checkpoint):
 
 def main(args):
     print(f'Convert DeepSpeed Checkpoint to Universal Checkpoint')
-    global _PARAM_SHARD, _RESUME_ATOMS   # [X-MoE, 2026-10-07]
+    global _PARAM_SHARD, _RESUME_ATOMS, _PARAM_SHARD_BALANCED   # [X-MoE, 2026-10-07; 2026-10-10 the balanced shares]
     if getattr(args, 'param_shard', None):
         k, n = (int(x) for x in str(args.param_shard).split('/'))
         if not (0 <= k < n):
             raise ValueError(f'--param-shard {args.param_shard}: K must be in [0, N)')
         _PARAM_SHARD = (k, n)
+        _PARAM_SHARD_BALANCED = bool(getattr(args, 'param_shard_balanced', False))
     _RESUME_ATOMS = bool(getattr(args, 'resume_atoms', False)) or _PARAM_SHARD is not None
 
     print(f'Converting DeepSpeed checkpoint in {args.input_folder} to Universal checkpoint in {args.output_folder}')

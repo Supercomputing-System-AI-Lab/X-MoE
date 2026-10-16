@@ -6,11 +6,13 @@
 import os
 import time
 
+import torch
+
 from deepspeed.utils import logger
 from deepspeed.utils.tensor_fragment import map_to_flat_opt_states
 from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank
 from deepspeed.checkpoint.utils import load_checkpoint_file
-from deepspeed.checkpoint.constants import FP32_WEIGHT_KEY
+from deepspeed.checkpoint.constants import (FP32_WEIGHT_KEY, PARAM, CAT_DIM, VOCAB_TENSOR, PARAM_N_SUB_PARAMS, SUB_PARAM_SHAPE)
 from deepspeed.checkpoint.universal_checkpoint import universal_load_timing
 
 
@@ -74,6 +76,101 @@ class ZeROOptimizer(DeepSpeedOptimizer):
                     f'of the optimizer (load_optimizer_states=False: the moments, the step and the parameter groups\' '
                     f'hyper-parameters stay as this run built them)')
 
+    def _load_hp_weights_and_moments(self, lp_groups_name, zero_dir, param_name_aliases):
+        """[X-MoE 2026-10-15, XMOE_FINETUNE_KEEP_OPTIM=1; assistant_deep_dive/2026-10-15-adam_warmstart] The HOT weights-only load.
+        With Megatron's --finetune (load_optimizer_states=False) every parameter's fp32.pt AND its optimizer atoms (exp_avg.pt,
+        exp_avg_sq.pt) are loaded into this rank's fragments exactly as a resume loads them (load_hp_checkpoint_state with every key,
+        map_to_flat_opt_states), and the optimizer's step counter is set on EVERY parameter group: from a step.pt atom when the
+        converter wrote one, else from zero/optimizer_state.pt param_groups[*]['step'] (apex FusedAdam keeps the step in the group,
+        and ds_to_universal writes no step.pt for it; the lc128k-v2 step-1000 universal holds 13 groups each with step 1000). The
+        step matters: with 1000-step moments and a fresh step of 1 the bias correction scales the first update by
+        (1 - beta1) / sqrt(1 - beta2) = 0.1 / sqrt(0.05) = 2.24 at betas (0.9, 0.95).
+        Nothing else of the checkpoint is restored, which is what separates this from a resume: the groups' lr, betas, eps, weight
+        decay and multipliers stay as this run built them (the resume's positional group restore is NOT run, so iteration 1 does
+        not take the source run's lr), the loss scaler and the clip stay, and Megatron's --finetune keeps the iteration, the LR
+        schedule, the consumed samples and the data position at 0. Independent of the layout: the atoms are addressed per parameter
+        and the step per group, so the moments follow the weights under any TP/EP/DP (the group counts need not agree).
+        XMOE_KEEP_OPTIM_VERIFY="<name>,<name>,...": for the named parameters, every rank holding a fragment re-reads exp_avg_sq.pt and
+        exp_avg.pt from disk, slices them as the loader does (TP chunk on the atom's cat dim, then this rank's fragment) and prints
+        max |state - atom| against the flat optimizer state it just built (the probe's equality check)."""
+        tp_rank, tp_world_size = self._universal_tp_rank_and_size()
+        optim_state_path = os.path.join(zero_dir, "optimizer_state.pt")
+        step_from_file, n_groups_file = None, None
+        if os.path.isfile(optim_state_path):
+            optim_sd = load_checkpoint_file(optim_state_path)
+            pgs = optim_sd.get('param_groups') or []
+            n_groups_file = len(pgs)
+            steps_pg = [g['step'] for g in pgs if 'step' in g]
+            if steps_pg:
+                assert all(st == steps_pg[0] for st in steps_pg), \
+                    f'{optim_state_path}: the parameter groups hold unequal steps {steps_pg}; refusing to guess'
+                step_from_file = steps_pg[0]
+        verify = [v.strip() for v in os.environ.get('XMOE_KEEP_OPTIM_VERIFY', '').split(',') if v.strip()]
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        loaded, all_keys, restored_step = 0, set(), None
+        lp_groups = getattr(self, lp_groups_name)
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            opt_keys, steps, to_verify = set(), [], []
+            for lp in lp_groups[i]:
+                if lp._hp_mapping is None:
+                    continue
+                name = self.param_names[lp]
+                folder = self._hp_param_folder(zero_dir, name, param_name_aliases)
+                step = lp.load_hp_checkpoint_state(folder, tp_rank, tp_world_size)   # every atom: fp32 + exp_avg + exp_avg_sq (+ step)
+                for key in lp._hp_mapping.get_optim_state_keys():
+                    opt_keys.add(key)
+                steps.append(step)
+                loaded += 1
+                if name in verify:
+                    to_verify.append((lp, name, folder))
+            all_keys |= opt_keys
+            hp_param = param_group['params'][0]
+            assert all(st == steps[0] for st in steps), f"Steps {steps} are not equal"
+            if steps and steps[0] is not None:
+                self.optimizer.state[hp_param]['step'] = steps[0]
+                restored_step = steps[0]
+            map_to_flat_opt_states(hp_param, lp_groups[i], self.optimizer.state, opt_keys)
+            for lp, name, folder in to_verify:
+                self._xmoe_verify_fragment(lp, name, folder, hp_param, tp_rank, tp_world_size, rank)
+        step = restored_step if restored_step is not None else step_from_file
+        assert step is not None, (f'XMOE_FINETUNE_KEEP_OPTIM=1: no optimizer step found in {zero_dir} (no step.pt atom and no '
+                                  f"param_groups[*]['step'] in optimizer_state.pt); refusing a hot start with a step of 0")
+        for param_group in self.optimizer.param_groups:
+            param_group['step'] = step
+        src = 'the step.pt atoms' if restored_step is not None else f"optimizer_state.pt param_groups[*]['step'] ({n_groups_file} groups saved, {len(self.optimizer.param_groups)} built here)"
+        msg = (f'[XMOE_FINETUNE_KEEP_OPTIM] universal checkpoint {zero_dir}: loaded the fp32 master weights AND the optimizer moments '
+               f'{sorted(all_keys)} of {loaded} parameters on rank {rank}; the optimizer step counter is {step} on all '
+               f'{len(self.optimizer.param_groups)} parameter groups (from {src}); the groups\' lr / betas / eps / weight decay, the '
+               f'loss scaler and the clip stay as this run built them; the iteration, the LR schedule, the consumed samples and the '
+               f'data position start at 0 (--finetune)')
+        logger.info(msg)
+        if rank == 0:
+            print(msg, flush=True)
+
+    def _xmoe_verify_fragment(self, lp, name, folder, hp_param, tp_rank, tp_world_size, rank):
+        """Print max |flat optimizer state - atom on disk| for this rank's fragment of one parameter (exp_avg_sq and exp_avg)."""
+        hp_addr = lp._hp_mapping.get_hp_fragment_address()
+        lp_addr = lp._hp_mapping.lp_fragment_address
+        for key in ('exp_avg_sq', 'exp_avg'):
+            f = os.path.join(folder, f'{key}.pt')
+            try:
+                ck = load_checkpoint_file(f)
+                full = ck[PARAM]
+                special = ck.get(VOCAB_TENSOR, False) or ck.get(PARAM_N_SUB_PARAMS, 1) > 1 or ck.get(SUB_PARAM_SHAPE, None) is not None
+                if special:
+                    print(f'[keep-optim verify] rank {rank} {name} {key}: skipped (vocab / sub-parameter atom layout)', flush=True)
+                    continue
+                if full.shape != lp.shape:
+                    full = full.chunk(tp_world_size, ck.get(CAT_DIM, 0))[tp_rank]
+                atom = full.flatten().narrow(0, lp_addr.start, lp_addr.numel).float()
+                state = self.optimizer.state[hp_param][key].narrow(0, hp_addr.start, hp_addr.numel).detach().float().cpu()
+                diff = (state - atom).abs().max().item() if atom.numel() else 0.0
+                print(f'[keep-optim verify] rank {rank} {name} {key}: fragment numel {atom.numel()} (of {full.numel()} in this TP slice), '
+                      f'max|state - atom| = {diff:.6e}, |atom|_2 = {atom.double().norm().item():.6e}, atom[0:3] = {atom[:3].tolist()}',
+                      flush=True)
+            except Exception as e:
+                print(f'[keep-optim verify] rank {rank} {name} {key}: FAILED ({type(e).__name__}: {e})', flush=True)
+
     def load_hp_checkpoint_state_from_checkpoint_dir(self,
                                                      lp_groups_name: str,
                                                      checkpoint_dir: str,
@@ -100,7 +197,11 @@ class ZeROOptimizer(DeepSpeedOptimizer):
             t_bracket0 = time.perf_counter_ns()
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
         if not load_optimizer_states:
-            self._load_hp_weights_only(lp_groups_name, checkpoint_dir, param_name_aliases)
+            if os.environ.get('XMOE_FINETUNE_KEEP_OPTIM') == '1':
+                # [X-MoE 2026-10-15] the HOT weights-only load: weights + Adam moments + step; see the method
+                self._load_hp_weights_and_moments(lp_groups_name, checkpoint_dir, param_name_aliases)
+            else:
+                self._load_hp_weights_only(lp_groups_name, checkpoint_dir, param_name_aliases)
             return
         optim_state_path = os.path.join(checkpoint_dir, "optimizer_state.pt")
         assert os.path.isfile(

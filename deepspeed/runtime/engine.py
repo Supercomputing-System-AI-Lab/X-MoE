@@ -2043,9 +2043,9 @@ class DeepSpeedEngine(Module):
         # Fix: sync all ranks before backward to prevent NCCL collective ordering mismatch
         # in multi-node ZeRO-3. Without this, ranks on different nodes enter loss.backward()
         # at different times, causing ZeRO-3's all_gather/reduce_scatter operations to deadlock.
-        # See: https://github.com/microsoft/DeepSpeed/issues/XXXX
-        # Zixian: 06/02/2026: Including the if to prevent deadlock when PP is enabled. 
-        if self.zero_optimization_partition_weights() and not self.is_pipe_paralle:
+        # Zixian: 06/02/2026: Including the if to prevent deadlock when PP is enabled.
+        # is_pipe_parallel exists only on PipelineEngine.
+        if self.zero_optimization_partition_weights() and not getattr(self, 'is_pipe_parallel', False):
             get_accelerator().synchronize()
             dist.barrier()
 

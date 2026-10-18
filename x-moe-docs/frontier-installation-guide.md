@@ -38,7 +38,7 @@ variables to export in the training environment.
 
 ```bash
 module reset
-module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja/1.12.1.lua
+module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja
 export CXX=/opt/cray/pe/gcc-native/13/bin/g++
 export CC=/opt/cray/pe/gcc-native/13/bin/gcc
 ```

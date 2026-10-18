@@ -50,7 +50,7 @@
 # PREREQUISITE (do this once, by hand — it is how you got this script):
 #   module reset
 #   module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 \
-#               craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja/1.12.1.lua
+#               craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja
 #   cd /lustre/orion/<proj>/proj-shared/$USER            # NOT ~ — see above
 #   git clone -b X-MoE-4D --single-branch https://github.com/Supercomputing-System-AI-Lab/X-MoE.git
 #   cd X-MoE && ./setup_env_rocm.sh
@@ -115,7 +115,7 @@ GCC_NATIVE_BIN="${GCC_NATIVE_BIN:-/opt/cray/pe/gcc-native/13/bin}"
 RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$DEPS_DIR/xmoe_4d_runtime_env.sh}"
 
 # Exact Frontier module stack (kept identical to the manual prerequisite).
-MODULE_STACK="cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja/1.12.1.lua"
+MODULE_STACK="cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja"
 
 # ---------------------------------------------------------------------------
 # pretty logging

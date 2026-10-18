@@ -1209,6 +1209,9 @@ class DeepSpeedEngine(Module):
         self.seq_data_parallel_group = groups._get_sequence_data_parallel_group()
         self.seq_dp_world_size = groups._get_sequence_data_parallel_world_size()
         self.mp_world_size = groups._get_model_parallel_world_size()
+        # filename-coordinate width (see _checkpoint_mp_world_size); == mp_world_size
+        # everywhere except a pipeline grid with a custom (uneven) partition
+        self.ckpt_mp_world_size = self._checkpoint_mp_world_size(self.mpu, self.mp_world_size)
         self.expert_parallel_group = groups._get_expert_parallel_group_dict()
         self.expert_data_parallel_group = groups._get_expert_data_parallel_group_dict()
         self.sequence_parallel_size = groups._get_sequence_parallel_world_size()
@@ -2737,8 +2740,38 @@ class DeepSpeedEngine(Module):
         )
         return zero_ckpt_name
 
+    @staticmethod
+    def _checkpoint_mp_rank(mpu):
+        """Model-parallel coordinate for checkpoint FILENAMES.
+
+        Prefers the pipeline grid's stage-spanning checkpoint accessor
+        (pipe_rank * tp_size + tp_rank). The grid's runtime
+        get_model_parallel_rank may be collapsed to the tensor slice under a
+        custom (uneven) pipeline partition -- a load-bearing runtime behavior --
+        but mp_rank_<n> is the only per-stage discriminator in the flat
+        checkpoint layout, so filenames must keep the stage or every stage
+        overwrites the same files. Non-pipeline mpus (Megatron's module) have no
+        such accessor; their model-parallel rank is already the correct
+        filename coordinate.
+        """
+        if mpu is None:
+            return 0
+        fn = getattr(mpu, 'get_checkpoint_model_parallel_rank', None)
+        return fn() if fn is not None else mpu.get_model_parallel_rank()
+
+    @staticmethod
+    def _checkpoint_mp_world_size(mpu, default):
+        """Filename-coordinate counterpart of _checkpoint_mp_rank: the number of
+        mp_rank_* files a checkpoint has. Must change together with the rank
+        (the load path asserts len(files) == world size)."""
+        if mpu is not None:
+            fn = getattr(mpu, 'get_checkpoint_model_parallel_world_size', None)
+            if fn is not None:
+                return fn()
+        return default
+
     def _get_zero_ckpt_name(self, checkpoints_path, tag):
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
         pp_rank = dist.get_rank(group=self.optimizer.dp_process_group)
         bf16_mode = self.bfloat16_enabled()
         return self._get_rank_zero_ckpt_name(checkpoints_path, tag, mp_rank, pp_rank, bf16_mode)
@@ -2747,7 +2780,7 @@ class DeepSpeedEngine(Module):
         if mp_placeholder is not None:
             mp_rank_str = mp_placeholder
         else:
-            mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+            mp_rank = self._checkpoint_mp_rank(self.mpu)
             mp_rank_str = f"{mp_rank:02d}"
 
         if self.zero_optimization_partition_weights():
@@ -2769,14 +2802,14 @@ class DeepSpeedEngine(Module):
         return ckpt_name
 
     def _get_optimizer_ckpt_name(self, checkpoints_path, tag, expp_rank):
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
         ckpt_name = os.path.join(checkpoints_path, str(tag),
                                  f'expp_rank_{expp_rank}_mp_rank_{mp_rank:02d}_optim_states.pt')
         return ckpt_name
 
     @staticmethod
     def _get_expert_ckpt_name(checkpoints_path, layer_id, expert_id, tag, mpu=None):
-        mp_rank = 0 if mpu is None else mpu.get_model_parallel_rank()
+        mp_rank = DeepSpeedEngine._checkpoint_mp_rank(mpu)
         if layer_id <= -1:
             # Used to support old checkpoint loading
             ckpt_name = os.path.join(checkpoints_path, '' if tag is None else str(tag),
@@ -2902,8 +2935,8 @@ class DeepSpeedEngine(Module):
 
         is_pipe_parallel = isinstance(self.module, PipelineModule)
 
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
-        load_path, checkpoint, _ = sd_loader.load(self.mp_world_size, mp_rank, is_pipe_parallel=is_pipe_parallel)
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
+        load_path, checkpoint, _ = sd_loader.load(self.ckpt_mp_world_size, mp_rank, is_pipe_parallel=is_pipe_parallel)
 
         if checkpoint is None:
             return None, None
@@ -3075,7 +3108,7 @@ class DeepSpeedEngine(Module):
         return zero_ckpt_names
 
     def _get_all_zero_checkpoint_names(self, load_dir, tag, bf16_mode):
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        mp_rank = self._checkpoint_mp_rank(self.mpu)
         zero_ckpt_names = self._get_mp_rank_zero_checkpoint_names(load_dir=load_dir,
                                                                   tag=tag,
                                                                   mp_rank=mp_rank,
@@ -3346,7 +3379,7 @@ class DeepSpeedEngine(Module):
                 'dp_world_size':
                 self.dp_world_size,
                 'mp_world_size':
-                self.mp_world_size,
+                self.ckpt_mp_world_size,
                 'num_experts':
                 self.num_experts
             }
@@ -3411,7 +3444,7 @@ class DeepSpeedEngine(Module):
                      global_steps=self.global_steps,
                      global_samples=self.global_samples,
                      dp_world_size=self.seq_dp_world_size,
-                     mp_world_size=self.mp_world_size,
+                     mp_world_size=self.ckpt_mp_world_size,
                      ds_config=self.config,
                      ds_version=version)
         state.update(client_state)

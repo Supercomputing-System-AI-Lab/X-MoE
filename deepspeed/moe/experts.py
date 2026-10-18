@@ -10,17 +10,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from deepspeed.accelerator import get_accelerator
-from .grouped_gemm.fused_bias_gelu import bias_gelu_impl
-        
-from .grouped_gemm.fused_bias_gelu import bias_gelu_impl
-try:
-    from .grouped_gemm.interface import grouped_gemm
-except ImportError:
-    # Provide a clear error message if the import fails during instantiation
-    raise ImportError(
-        "[deepspeed/moe/experts.py] FusedExperts_Triton requires the grouped_gemm kernel. "
-        "Please install it or use a different expert class."
-    )
+from .fused_bias_gelu import bias_gelu_impl
 import os 
 print (f'os.getenv ("USE_AITER_GROUPGEMM"): {os.getenv ("USE_AITER_GROUPGEMM")}')
 if os.getenv ("USE_AITER_GROUPGEMM") == "True": 

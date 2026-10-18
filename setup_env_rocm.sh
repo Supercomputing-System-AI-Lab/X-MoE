@@ -213,8 +213,18 @@ EOF
 
 ensure_module_cmd() {
     if ! type module >/dev/null 2>&1; then
-        source /etc/profile.d/lmod.sh 2>/dev/null \
-            || source /usr/share/lmod/lmod/init/bash 2>/dev/null \
+        # The Cray PE init comes first: it defines `module` AND sets the MODULEPATH and the default modules
+        # that `module reset` needs (a bare Lmod init has neither, and `module reset` then fails).
+        # SUSE (Frontier): /etc/bash.bashrc.local; RHEL: /etc/profile.d/zz-cray-pe.sh. System files are not
+        # written for `set -eu`, so it is relaxed while they are sourced.
+        local f
+        set +eu
+        for f in /etc/bash.bashrc.local /etc/profile.d/zz-cray-pe.sh /opt/cray/pe/lmod/lmod/init/bash \
+                 /etc/profile.d/lmod.sh /usr/share/lmod/lmod/init/bash; do
+            [ -r "$f" ] && source "$f" >/dev/null 2>&1 && type module >/dev/null 2>&1 && break
+        done
+        set -eu
+        type module >/dev/null 2>&1 \
             || { echo "ERROR: 'module' command unavailable and lmod init not found." >&2; exit 1; }
     fi
 }

@@ -317,8 +317,12 @@ class MOEv2Layer(Base):
             expert_output_uneven = self.experts(dispatched_output, output_splits_tensor)
             # print (f'[moe_v2.py] AFTER EXPERT {expert_output_uneven.shape=}')
         
-            if os.getenv ("USE_TRITON_GROUPGEMM") != 'True': 
-                # print ("WITHOUT USING TRITON GROUPGEMM")
+            # Experts and FusedExperts_Primus return rows grouped by expert, which must be reordered
+            # by source rank for the combine all-to-all; FusedExperts_Triton writes every output row
+            # at its input position, already grouped by source rank.
+            from .experts import FusedExperts_Triton
+            experts_rank_major = isinstance(self.experts, FusedExperts_Triton)
+            if not experts_rank_major:
                 # recover the expert output uneven
                 M = output_splits_tensor.shape[0]
                 N = self.num_local_experts
@@ -347,8 +351,8 @@ class MOEv2Layer(Base):
                 with record_function ("MoE - Combine A2A"): 
                     expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
         
-            # If using triton groupgemm 
-            if os.getenv ("USE_TRITON_GROUPGEMM") == 'True': 
+            # If using triton groupgemm (rows already rank-major)
+            if experts_rank_major:
                 # print ("USING TRITON GROUPGEMM")
                 if self.wall_clock_breakdown:
                     # torch.distributed.barrier()

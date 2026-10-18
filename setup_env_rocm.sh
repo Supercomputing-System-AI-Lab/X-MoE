@@ -91,9 +91,10 @@ export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$CACHE_DIR/pip}"
 export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_DIR/conda}"
 export TMPDIR="${TMPDIR:-$CACHE_DIR/tmp}"
 
-# Free space required under XMOE4D_ROOT, checked BEFORE any stage runs. Measured:
-# conda env ~20 GB + caches ~4 GB, peaking higher during the apex/flash-attn build.
-MIN_FREE_GB="${MIN_FREE_GB:-25}"
+# Free space required under XMOE4D_ROOT, checked BEFORE any stage runs. Measured on a full build with the
+# optional stages: conda env 22 GB, deps 3.5 GB, caches 1.4 GB, clone with sample data 3.0 GB at the end, and
+# the pip cache alone reached 11 GB during the torch stage.
+MIN_FREE_GB="${MIN_FREE_GB:-40}"
 
 # Pinned versions (reproduction targets).
 APEX_VERSION="1.11.0"          # verified after build; warns on drift
@@ -204,7 +205,7 @@ check_space() {
         printf "         XMOE4D_ROOT=%s  (need >= %s GB).\n" "$XMOE4D_ROOT" "$MIN_FREE_GB" >&2
         cat >&2 <<EOF
 
-         The full stack needs ~25 GB (a ~20 GB conda env plus pip/conda caches).
+         The full stack needs about 30 GB (a 22 GB conda env plus sources and caches), more while it builds.
          Point XMOE4D_ROOT at a bigger filesystem. On OLCF use a NON-PURGED
          Lustre area (scratch IS purged; /ccs/home is quota-limited):
 

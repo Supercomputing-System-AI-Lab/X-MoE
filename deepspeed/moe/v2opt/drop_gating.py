@@ -1,3 +1,7 @@
+# Copyright 2024 Databricks
+# SPDX-License-Identifier: Apache-2.0
+# Derived from MegaBlocks (https://github.com/databricks/megablocks) and modified for X-MoE.
+
 import torch
 from typing import Tuple, Any, Optional
 

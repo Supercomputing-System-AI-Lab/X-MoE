@@ -96,8 +96,13 @@ With `torchrun` (one node, 8 GPUs):
 cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
 ./run_exp_training.sh env_validate
 ```
-With Slurm on Frontier:
+With Slurm on Frontier (the job runs in the environment of the shell that submits it, so load the modules and
+activate the environment first):
 ```bash
+module reset
+module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja
+conda activate <XMOE4D_ROOT>/XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro
+source <XMOE4D_ROOT>/XMoE4D_deps/xmoe_4d_runtime_env.sh    # written by ./setup_env_rocm.sh aws-ofi-rccl
 export SBATCH_ACCOUNT=<your project>
 cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts-frontier
 ./run_exp_training.sh env_validate

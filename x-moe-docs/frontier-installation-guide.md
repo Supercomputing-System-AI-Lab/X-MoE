@@ -94,8 +94,14 @@ pip install six nltk pandas openpyxl matplotlib tensorboard py-spy
 ## 4. Running X-MoE-4D on Frontier
 
 `run_exp_training.sh` submits Slurm jobs itself, so run it from a login node; it needs your project account.
+The jobs run in the environment of the shell that submits them (the Slurm template loads no modules and activates
+no environment), so load the modules, activate the environment and source the runtime file first.
 
 ```bash
+module reset
+module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja
+conda activate <XMOE4D_ROOT>/XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro
+source <XMOE4D_ROOT>/XMoE4D_deps/xmoe_4d_runtime_env.sh    # from the aws-ofi-rccl stage: plugin, CC/CXX
 export SBATCH_ACCOUNT=<your project>
 cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data && bash prepare_data_ae.sh    # once
 cd ../scripts-frontier

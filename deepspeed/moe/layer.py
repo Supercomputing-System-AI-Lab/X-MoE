@@ -245,7 +245,6 @@ class MoE(nn.Module):
 
         output = self.deepspeed_moe(hidden_states, used_token)
         # see_memory_usage("after MoE", force=SEE_MEMORY) 
-        # torch.cuda.memory._dump_snapshot("/lustre/orion/gen150/scratch/pinaster/moe-arch/system-benchmark/deepseek-style/profile/moe-layer.pickle")
         # torch.cuda.memory._record_memory_history(enabled=None)
         if self.use_residual:
             # Residual MoE

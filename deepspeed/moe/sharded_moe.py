@@ -37,7 +37,6 @@ torch_max_memory_reserved = get_accelerator().max_memory_reserved
 from .v2opt.gating import gather, scatter, indices_and_bins
 from .v2opt.drop_gating import gather_with_token_drop, scatter_with_token_drop, indices_and_bins_and_drop
 
-RANDOM_VERIFY = False
 
 # torch.set_printoptions(threshold=float('inf'))
 
@@ -935,11 +934,6 @@ class MOELayer(Base):
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
 
-        if RANDOM_VERIFY:
-            torch.manual_seed(42)
-            reshaped_input = torch.randn(reshaped_input.size()).to(reshaped_input.dtype).cuda()
-            if dist.get_rank() == 0:
-                print("reshaped_input:", reshaped_input)
 
         tensor_model_world_size = bwc_tensor_model_parallel_world_size(groups.mpu)
         if tensor_model_world_size > 1 and groups._get_expert_model_parallel_world_size() == 1:
@@ -969,10 +963,6 @@ class MOELayer(Base):
             torch.distributed.barrier()
             self.timers(DISPATCH_TIMER).stop()
             self.time_dispatch = self.timers(DISPATCH_TIMER).elapsed(reset=False)
-
-        if RANDOM_VERIFY and dist.get_rank() == 0:
-            print(f"dispatched_input {dispatched_input.size()}: {dispatched_input}")
-            torch.save(dispatched_input, f"/lustre/orion/gen150/scratch/pinaster/moe-arch/system-benchmark/deepseek-style/tensor_verif/tensor_dispatched_input_sp_{USE_SP}_tp_{groups._get_expert_model_parallel_world_size()}.pth")
 
         if self.wall_clock_breakdown:
             torch.cuda.synchronize()
@@ -1076,11 +1066,6 @@ class MOELayer(Base):
 
         a = combined_output.reshape(input[0].shape)
         
-        if RANDOM_VERIFY:
-            if dist.get_rank() == 0:
-                print("combined_output: ", a)
-            torch.save(a, f"/lustre/orion/gen150/scratch/pinaster/moe-arch/system-benchmark/deepseek-style/tensor_verif/tensor_a_sp_{USE_SP}_tp_{groups._get_expert_model_parallel_world_size()}.pth")
-
         if self.wall_clock_breakdown:
             torch.cuda.synchronize()
             torch.distributed.barrier()

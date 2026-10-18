@@ -56,7 +56,7 @@
 #   cd X-MoE && ./setup_env_rocm.sh
 #
 # OVERRIDES: XMOE4D_ROOT, ENV_PREFIX, DEPS_DIR, CACHE_DIR, MAX_JOBS, APEX_GIT_REF,
-#            LIBFABRIC_PATH, GCC_NATIVE_BIN, RUNTIME_ENV_FILE, MIN_FREE_GB
+#            LIBFABRIC_PATH, GCC_NATIVE_BIN, RUNTIME_ENV_FILE, MIN_FREE_GB, GPU_ARCHS
 ###############################################################################
 
 set -euo pipefail
@@ -101,6 +101,9 @@ APEX_VERSION="1.11.0"          # verified after build; warns on drift
 # commit of the validated build (its apex/git_version_info_installed.py says git_hash=af25af4).
 APEX_GIT_REF="${APEX_GIT_REF:-af25af4e26f0546d897c3e2ff31502ef50530ecc}"
 FLASH_ATTN_TAG="v2.8.3"        # built from source (ROCm needs a source build)
+# The GPU architecture flash-attention is compiled for (MI250X = gfx90a). Without it, flash-attention asks
+# the visible GPU, which fails on a node that has none.
+GPU_ARCHS="${GPU_ARCHS:-gfx90a}"
 TORCH_INDEX="https://download.pytorch.org/whl/rocm6.4"   # validated: torch 2.9.1+rocm6.4
 TORCH_VERSION="${TORCH_VERSION:-2.9.1}"
 TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.24.1}"
@@ -325,7 +328,7 @@ stage_flashattn() {
     fi
     cd flash-attention
     git checkout "$FLASH_ATTN_TAG"     # repo HEAD is FA4 beta otherwise
-    MAX_JOBS="$MAX_JOBS" pip install . --no-build-isolation
+    GPU_ARCHS="$GPU_ARCHS" MAX_JOBS="$MAX_JOBS" pip install . --no-build-isolation
     python -c "import flash_attn; print('  flash_attn', flash_attn.__version__)"
     ok "flash-attention $FLASH_ATTN_TAG installed."
 }

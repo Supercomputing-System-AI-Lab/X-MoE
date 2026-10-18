@@ -79,7 +79,7 @@ The example templates pass `--use-flash-attn-v2`, so FlashAttention is required.
 ```bash
 git clone https://github.com/Dao-AILab/flash-attention.git && cd flash-attention
 git checkout v2.8.3
-MAX_JOBS=64 pip install . --no-build-isolation
+GPU_ARCHS=gfx90a MAX_JOBS=64 pip install . --no-build-isolation
 cd ..
 ```
 

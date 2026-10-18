@@ -8,6 +8,7 @@ import torch
 from .constants import (BASE_OPTIMIZER_STATE, GROUP_PADDINGS, OPTIMIZER_STATE_DICT, PARTITION_COUNT)
 
 from .reshape_utils import (basic_folder_validation, get_zero_files, merge_state)
+from .utils import load_checkpoint_file
 
 from .reshape_3d_utils import (model_3d_desc, get_model_3d_descriptor)
 
@@ -54,7 +55,11 @@ class ZeROCheckpoint(object):
         state_file_list = self.get_files_for_rank(pp_index, tp_index, dp_index)
         merged_sd = None
         for state_file in state_file_list:
-            sd = torch.load(state_file, map_location=torch.device('cpu'))
+            # NOTE: deliberately NOT mmap=True. These are the ~23 GiB ZeRO shards; on Lustre,
+            # mmap turns one sequential read into 4 KB demand-paged network round trips and the
+            # extract workers wedge in uninterruptible sleep. Bound memory with
+            # --num_extract_workers instead (each worker holds one whole shard).
+            sd = load_checkpoint_file(state_file)
             for key in keys_to_ignore:
                 sd.pop(key, None)
 

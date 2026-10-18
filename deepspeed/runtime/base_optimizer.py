@@ -9,6 +9,7 @@ import torch
 from deepspeed.utils import logger
 from deepspeed.utils.tensor_fragment import map_to_flat_opt_states
 from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank
+from deepspeed.checkpoint.utils import load_checkpoint_file
 
 
 class DeepSpeedOptimizer(object):
@@ -22,7 +23,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         optim_state_path = os.path.join(checkpoint_dir, "optimizer_state.pt")
         assert os.path.isfile(
             optim_state_path), f'{optim_state_path} containing optimizer global state is missing! Cannot proceed.'
-        optim_sd = torch.load(optim_state_path)
+        optim_sd = load_checkpoint_file(optim_state_path)
 
         self._load_global_state(optim_sd)
 

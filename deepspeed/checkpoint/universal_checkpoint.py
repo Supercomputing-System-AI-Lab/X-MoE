@@ -10,6 +10,7 @@ import types
 from typing import List, Tuple, Union
 from dataclasses import dataclass
 from .constants import (FP32_WEIGHT_KEY, PARAM, VOCAB_TENSOR, CAT_DIM, PARAM_N_SUB_PARAMS, SUB_PARAM_SHAPE)
+from .utils import load_checkpoint_file
 
 
 @dataclass
@@ -34,7 +35,7 @@ def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size):
     step = None
     for key in hp_keys:
         ckpt_file = os.path.join(folder, f"{key}.pt")
-        ckpt_dict = torch.load(ckpt_file)
+        ckpt_dict = load_checkpoint_file(ckpt_file)
 
         if key == "step":
             step = ckpt_dict

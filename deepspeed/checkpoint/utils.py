@@ -3,9 +3,34 @@
 
 # DeepSpeed Team
 
+import inspect
 import os
 import torch
 from .constants import (MODEL_FILE_PREFIX, MODEL_FILE_SUFFIX, OPTIM_FILE_SUFFIX, ZERO_FILE_PREFIX)
+
+
+# Probed once, at import. torch.load's signature does not change at runtime, and this is on
+# the path of every checkpoint file DeepSpeed reads.
+_TORCH_LOAD_ACCEPTS_WEIGHTS_ONLY = 'weights_only' in inspect.signature(torch.load).parameters
+
+
+def load_checkpoint_file(path, map_location=torch.device('cpu')):
+    """torch.load() for DeepSpeed checkpoint files.
+
+    torch >= 2.6 defaults ``weights_only=True``. That unpickler restores tensors and plain
+    containers only, and a DeepSpeed checkpoint legitimately contains other objects --
+    ``argparse.Namespace`` in mp_rank files, ``LossScaler`` / ``ZeroStageEnum`` /
+    ``DeepSpeedConfig`` in ZeRO shards. These files are written by DeepSpeed itself, so full
+    unpickling is what is intended, and it is what the runtime's own checkpoint engine
+    already does (runtime/checkpoint_engine/torch_checkpoint_engine.py).
+
+    ``weights_only`` is forwarded only when the running torch accepts it, so the same call
+    works unchanged on versions that predate the argument.
+    """
+    kwargs = {'map_location': map_location}
+    if _TORCH_LOAD_ACCEPTS_WEIGHTS_ONLY:
+        kwargs['weights_only'] = False
+    return torch.load(path, **kwargs)
 
 
 def get_model_ckpt_name_for_rank(base_folder, mp_rank_str):

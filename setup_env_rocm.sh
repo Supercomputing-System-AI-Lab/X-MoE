@@ -108,8 +108,9 @@ MAX_JOBS="${MAX_JOBS:-64}"
 
 # AWS-OFI-RCCL plugin (Slingshot networking). These paths are environment-specific;
 # verify against your loaded modules:  module show libfabric   |   echo "$MPICH_DIR"
-# libfabric default matches the validated build (Cray libfabric 1.22.0).
-LIBFABRIC_PATH="${LIBFABRIC_PATH:-/opt/cray/libfabric/1.22.0}"
+# The validated build used Cray libfabric 1.22.0, which Frontier no longer has (2026-10: 1.15.x, 1.20.1, 2.3.1).
+# Empty = the libfabric of the loaded modules (pkg-config prefix), resolved in the aws-ofi-rccl stage.
+LIBFABRIC_PATH="${LIBFABRIC_PATH:-}"
 # Native GCC 13 bin dir — runtime CC/CXX so on-the-fly C++/HIP extension rebuilds
 # match the Stage-2 toolchain.
 GCC_NATIVE_BIN="${GCC_NATIVE_BIN:-/opt/cray/pe/gcc-native/13/bin}"
@@ -367,8 +368,12 @@ stage_rccl() {
     load_modules
     : "${MPICH_DIR:?MPICH_DIR unset — is cray-mpich loaded?}"
     local rocm="${ROCM_PATH:-/opt/rocm-6.4.1}"
+    [ -n "$LIBFABRIC_PATH" ] || LIBFABRIC_PATH="$(pkg-config --variable=prefix libfabric 2>/dev/null || true)"
     info "ROCm=$rocm | libfabric=$LIBFABRIC_PATH | MPICH_DIR=$MPICH_DIR"
-    [ -d "$LIBFABRIC_PATH" ] || warn "libfabric path '$LIBFABRIC_PATH' not found — check 'module show libfabric' and set LIBFABRIC_PATH."
+    if [ -z "$LIBFABRIC_PATH" ] || [ ! -f "$LIBFABRIC_PATH/include/rdma/fabric.h" ]; then
+        echo "ERROR: no libfabric headers at '$LIBFABRIC_PATH/include/rdma/fabric.h'. Check 'module show libfabric' and set LIBFABRIC_PATH." >&2
+        exit 1
+    fi
     mkdir -p "$DEPS_DIR"; cd "$DEPS_DIR"
     if [ ! -d aws-ofi-rccl/.git ]; then
         git clone --recursive https://github.com/ROCmSoftwarePlatform/aws-ofi-rccl

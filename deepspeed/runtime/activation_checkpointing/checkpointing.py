@@ -342,14 +342,12 @@ def merge_tensors(tensor_objects, non_tensor_objects, tensor_flags):
 
     # remove the flags that are assigned to the size of the flattened tensors
     if PARTITION_ACTIVATIONS:
-        real_tensor_flags = []
-        previous_flag = False
-        for flag in tensor_flags:
-            if previous_flag:
-                previous_flag = False
-                continue
-            previous_flag = flag
-            real_tensor_flags.append(flag)
+        # get_partitioned_activations_for_backward saves two entries per argument,
+        # (argument, size), so both the flags and the non-tensor slots are read with
+        # stride 2. Skipping an entry only after a True flag kept both entries of every
+        # non-tensor argument, and the backward recompute received too many arguments.
+        real_tensor_flags = tensor_flags[0::2]
+        non_tensor_objects = non_tensor_objects[0::2]
     else:
         real_tensor_flags = tensor_flags
 
@@ -367,9 +365,16 @@ def merge_tensors(tensor_objects, non_tensor_objects, tensor_flags):
 def is_activation_to_checkpoint(item):
     """
         Is an activation to be checkpointed
+
+        A tensor that does not require grad is never partitioned or offloaded. The
+        partition and CPU paths free each checkpointed argument in place, which is only
+        safe for an argument private to one checkpointed call; a grad-free input such
+        as the rotary table that Megatron passes to every layer is shared, so freeing
+        it after the first layer left the next layer an empty tensor.
     """
     global mp_size
-    return torch.is_tensor(item) and item.is_floating_point() and item.numel() >= mp_size
+    return torch.is_tensor(item) and item.is_floating_point() and item.numel() >= mp_size \
+        and item.requires_grad
 
 
 def partition_activations(args, cpu_checkpoint, contiguous_checkpoint):

@@ -100,6 +100,8 @@ APEX_VERSION="1.11.0"          # verified after build; warns on drift
 APEX_GIT_REF="${APEX_GIT_REF:-}"   # optional exact commit/tag that yields 1.11.0
 FLASH_ATTN_TAG="v2.8.3"        # built from source (ROCm needs a source build)
 TORCH_INDEX="https://download.pytorch.org/whl/rocm6.4"   # validated: torch 2.9.1+rocm6.4
+TORCH_VERSION="${TORCH_VERSION:-2.9.1}"
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.24.1}"
 MAX_JOBS="${MAX_JOBS:-64}"
 
 # AWS-OFI-RCCL plugin (Slingshot networking). These paths are environment-specific;
@@ -262,7 +264,7 @@ stage_conda() {
 stage_torch() {
     CURRENT_STAGE="torch"; banner "PyTorch (ROCm 6.4)"
     load_modules; activate_env
-    pip3 install torch torchvision --index-url "$TORCH_INDEX"
+    pip3 install "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" --index-url "$TORCH_INDEX"
     python -c "import torch; print('  torch', torch.__version__, '| hip', torch.version.hip)"
     ok "torch installed."
 }
@@ -323,7 +325,10 @@ stage_xmoe() {
     pip install -e .
     cd "$XMOE_ROOT/Megatron-DeepSpeed-X-MoE"
     pip install -e .
-    ok "X-MoE stack installed (editable)."
+    # Runtime and analysis packages, the same list as setup_env_cuda.sh: utils/analyze_log.py
+    # imports pandas (and writes .xlsx through openpyxl), the planner imports matplotlib.
+    pip install -q six nltk pandas openpyxl matplotlib tensorboard py-spy
+    ok "X-MoE stack installed (editable) + runtime/analysis deps."
 }
 
 write_runtime_env() {

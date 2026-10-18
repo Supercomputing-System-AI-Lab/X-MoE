@@ -1,169 +1,132 @@
-# X-MoE Installation Guide for OLCF Frontier
+# X-MoE-4D Installation Guide for OLCF Frontier
 
+This guide installs and runs X-MoE-4D on **AMD GPUs**, with the OLCF Frontier supercomputer (AMD MI250X,
+ROCm 6.4.1) as the example. The same steps are a reference for other AMD systems.
 
-This guide provides step-by-step instructions for installing and running X-MoE on **AMD platforms**. We use OLCF Frontier supercomputer (equipped with MI250X) as an example here, and this guide can also provide general reference for installation on AMD platforms.
+There are two ways to build the environment: `setup_env_rocm.sh` runs every step with the versions that were
+validated, and the manual steps below run the same commands one by one.
 
-**For Frontier Users**: You can either build the environment yourself by following the guide below, or use our pre-built environment available on the Frontier system. To access the pre-built environment, simply run:
+## 1. Clone X-MoE-4D
+
+```bash
+cd /lustre/orion/<project>/proj-shared/$USER        # Lustre, not $HOME (see below)
+mkdir -p xmoe-4d && cd xmoe-4d
+git clone -b X-MoE-4D --recurse-submodules https://github.com/Supercomputing-System-AI-Lab/X-MoE
+cd X-MoE
 ```
-source activate /lustre/orion/world-shared/gen150/yueming/TORCH-ROCM6.3.1_env
+
+Keep the checkout and the environment on Lustre: `/ccs/home` has a 50 GB quota and the environment needs about
+20 GB, and `/lustre/orion/<project>/scratch` is purged, so `proj-shared` is the right place. Do not pass
+`--remote` to `git submodule update`; it moves the submodules away from the pinned commits.
+
+## 2. Build the environment with setup_env_rocm.sh (recommended)
+
+```bash
+./setup_env_rocm.sh                  # conda, torch, apex, mpi4py, flash-attention, X-MoE, verify
+./setup_env_rocm.sh aws-ofi-rccl     # the Slingshot plugin for RCCL; Frontier only
+./setup_env_rocm.sh primus           # optional: the Primus-Turbo grouped GEMM
 ```
 
-## Environment Setup
+`XMOE4D_ROOT` (by default the directory above the checkout, `xmoe-4d/` above) holds the conda environment
+`XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro`, the dependency sources and the caches. The script checks the free space
+first, and `./setup_env_rocm.sh <stage>` reruns one stage after a failure. The `aws-ofi-rccl` stage prints the
+variables to export in the training environment.
 
-### 1. Create Environment
+## 3. Manual installation (the same steps)
 
-Load the required modules for the Frontier system:
+### 3.1 Modules and compilers
 
 ```bash
 module reset
-module load cpe/24.11
-module load PrgEnv-gnu/8.6.0
-module load rocm/6.3.1
-module load craype-accel-amd-gfx90a
-module load miniforge3/23.11.0-0
-module load ninja/1.12.1.lua
-```
-
-### 2. Set Compiler Paths
-
-```bash
+module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja/1.12.1.lua
 export CXX=/opt/cray/pe/gcc-native/13/bin/g++
 export CC=/opt/cray/pe/gcc-native/13/bin/gcc
 ```
 
-These compiler paths are crucial for avoiding C++ ABI compatibility issues when building PyTorch extensions and CUDA kernels.
+The GCC 13 compilers avoid C++ ABI mismatches when PyTorch extensions and kernels are built. Export them in every
+new shell before training too.
 
-### 3. Create Conda Environment
-
-Create a Python environment with Python 3.11:
-
-```bash
-conda create -p $PWD/TORCH-ROCM6.3.1_env python=3.11 -c conda-forge -y
-source activate $PWD/TORCH-ROCM6.3.1_env
-```
-## Dependency Installation
-
-### 1. Install PyTorch with ROCm Support
-
-Install the nightly build of PyTorch with ROCm 6.3 support:
+### 3.2 Conda environment and PyTorch
 
 ```bash
-pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm6.3
+conda create -y -p $PWD/../XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro python=3.11
+conda activate $PWD/../XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro
+pip3 install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/rocm6.4
 ```
 
-
-### 2. Install NVIDIA Apex (ROCm Fork)
-
-Install the ROCm-compatible version of Apex for mixed precision training:
+### 3.3 Apex (ROCm fork)
 
 ```bash
-git clone https://github.com/ROCm/apex.git
-cd apex
+git clone https://github.com/ROCm/apex.git && cd apex
 pip install -r requirements.txt
 python setup.py install --cpp_ext --cuda_ext
+cd ..
 ```
 
+The validated build reports apex 1.11.0.
 
-### 3. Install MPI4Py
-
-Install MPI4Py with proper Cray MPI integration:
+### 3.4 mpi4py with Cray MPICH
 
 ```bash
-MPICC="cc -shared" pip install --no-cache-dir --no-binary=mpi4py mpi4py
+MPICC="cc -shared" pip install --no-cache-dir --force-reinstall --no-binary=mpi4py mpi4py
 ```
 
-### 4. Install Flash-Attention (Optional)
+### 3.5 FlashAttention (required)
 
-Flash-Attention requires building from source on AMD platforms:
+The example templates pass `--use-flash-attn-v2`, so FlashAttention is required. On AMD it is built from source:
 
 ```bash
-git clone https://github.com/Dao-AILab/flash-attention.git
-cd flash-attention
-python setup.py install
+git clone https://github.com/Dao-AILab/flash-attention.git && cd flash-attention
+git checkout v2.8.3
+MAX_JOBS=64 pip install . --no-build-isolation
+cd ..
 ```
 
-**Alternative:** If Flash-Attention fails to compile, you can disable it in your training scripts by removing the `--use-flash-attn` and `--use-flash-attn-v2` flags.
-
-## Installing X-MoE
+### 3.6 X-MoE and Megatron-DeepSpeed-X-MoE
 
 ```bash
-cd ~
-git clone https://github.com/Supercomputing-System-AI-Lab/X-MoE
-cd X-MoE
-git submodule update --init --recursive --remote
 pip install -e .
-cd Megatron-DeepSpeed-X-MoE && pip install -e .
+cd Megatron-DeepSpeed-X-MoE && pip install -e . && cd ..
+pip install six nltk pandas openpyxl matplotlib tensorboard py-spy
 ```
 
+## 4. Running X-MoE-4D on Frontier
 
-## Running X-MoE
-
-Here is an example of training a 10B model on **one computing node with 4 MI250X GPUs (8 GCDs)**. Here we assume you've requested for one computing node before running these commands.
-### 1. Set Compiler Environment
-
-Before running any training scripts, ensure the compiler paths are set:
+`run_exp_training.sh` submits Slurm jobs itself, so run it from a login node; it needs your project account.
 
 ```bash
-export CXX=/opt/cray/pe/gcc-native/13/bin/g++
-export CC=/opt/cray/pe/gcc-native/13/bin/gcc
-```
-
-**Important:** These exports must be done in every new shell session before running training scripts.
-
-### 2. Execute Training Script
-
-
-
-Navigate to the script directory and run the training:
-
-```bash
-cd X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts-frontier
-
-# Environment warm-up run: X-MoE 10B, 8 GPUs on 1 node
+export SBATCH_ACCOUNT=<your project>
+cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data && bash prepare_data_ae.sh    # once
+cd ../scripts-frontier
 ./run_exp_training.sh env_validate
 ```
 
-**Note**: The first run may require an additional 10 minutes to compile kernels
-Expectation:
+`env_validate` trains X-MoE 10B for 10 iterations on one node (8 GCDs, pipeline size 2, expert-parallel size 4).
+The first run compiles kernels, which can take about ten minutes more. The logs of each job are in
+`scripts-frontier/logs/job_<id>_.../`: the Slurm output `.o` and `.e`, one `rank_<i>.log` per rank and
+`full_run.log`. Every iteration line reports the throughput as `TFLOPs:` per GCD. With pipeline stages, the
+iteration lines are written by the last stage, so read the log of the last rank.
 
-**Expectation**:
-After initialization, you can see the training logs during training progress in the terminal. The training logs are collected under `scripts-frontier/logs/job_<ID>_.../` (`full_run.log`, per-rank `rank_*.log`).
+The other modes (training, the planner profiles, the paper's main results, the convergence check) are described in
+the examples README, `Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/README.md`.
 
+## 5. Troubleshooting
 
-This training script will launch the training with micro batch size 4, sequence length 2048, and train a model based on DeepSeek-MoE architecture from scratch. **Expected throughput is ~50-55 TFLOPs with X-MoE optimizations.**
-
-You may now modify the script to train with your own model settings.
-
-
-## Troubleshooting
-
-### Common Issues and Solutions
-
-#### 1. JIT Compiler Errors for Fused Kernels
-
-**Problem:** CUDA/ROCm kernels fail to compile during runtime with JIT compilation errors.
-
-**Solution:** Clear the build cache and ensure compiler paths are set:
+**JIT compile errors of the fused kernels.** Clear the build directory and check the compilers:
 
 ```bash
-cd X-MoE/Megatron-DeepSpeed-X-MoE/megatron/fused_kernels
-rm -rf build
-```
-
-Then ensure compiler environment is properly set:
-
-```bash
+rm -rf Megatron-DeepSpeed-X-MoE/megatron/fused_kernels/build
 export CXX=/opt/cray/pe/gcc-native/13/bin/g++
 export CC=/opt/cray/pe/gcc-native/13/bin/gcc
 ```
 
-Re-run the training script:
+**A job waits before its first step and never starts training.** A job killed while it compiled an extension leaves
+a `lock` file in `scripts-frontier/deepspeed/<extension>/` or in `megatron/fused_kernels/build/`. The templates
+delete locks older than 20 minutes at the start of every job; delete a newer one by hand if no other job is
+compiling.
 
-```bash
-./n8-Small-XMoE.slurm
-```
+**sbatch rejects the job.** Set `SBATCH_ACCOUNT` to a project you are a member of.
 
 ## Support and Resources
 
 - **OLCF Documentation:** [https://docs.olcf.ornl.gov/systems/frontier_user_guide.html](https://docs.olcf.ornl.gov/systems/frontier_user_guide.html)
-

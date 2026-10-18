@@ -64,6 +64,12 @@ case "$STAGE" in -h|--help|help) sed -n '2,45p' "$0" | sed 's/^#//; s/^ //'; exi
 # --- paths -------------------------------------------------------------------
 XMOE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 XMOE4D_ROOT="${XMOE4D_ROOT:-$(cd "$XMOE_ROOT/.." && pwd)}"   # the dir we NFS-export
+# The wire stage exports XMOE4D_ROOT to node 2 with root access. A checkout directly
+# under $HOME would export the whole home directory, ~/.ssh included.
+case "$(cd "$XMOE4D_ROOT" && pwd -P)" in
+    "$(cd "$HOME" && pwd -P)"|/)
+        die "XMOE4D_ROOT is $XMOE4D_ROOT, which would export it whole over NFS. Clone into ~/xmoe-4d/X-MoE (x-moe-docs/aws-multinode-guide.md) or set XMOE4D_ROOT to a directory used only by X-MoE." ;;
+esac
 SCRIPTS="$XMOE_ROOT/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts"
 CONDA_ROOT="${CONDA_ROOT:-$XMOE4D_ROOT/miniforge3}"
 ENV_PREFIX="${ENV_PREFIX:-$XMOE4D_ROOT/XMoE4D_envs/X-MoE-4D-CUDA12.8_repro}"

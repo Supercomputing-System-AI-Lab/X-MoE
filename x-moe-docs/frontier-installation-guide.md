@@ -58,6 +58,7 @@ pip3 install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytor
 
 ```bash
 git clone https://github.com/ROCm/apex.git && cd apex
+git checkout af25af4e26f0546d897c3e2ff31502ef50530ecc    # the validated commit (apex 1.11.0)
 pip install -r requirements.txt
 python setup.py install --cpp_ext --cuda_ext
 cd ..

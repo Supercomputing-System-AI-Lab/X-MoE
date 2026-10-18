@@ -97,7 +97,9 @@ MIN_FREE_GB="${MIN_FREE_GB:-25}"
 
 # Pinned versions (reproduction targets).
 APEX_VERSION="1.11.0"          # verified after build; warns on drift
-APEX_GIT_REF="${APEX_GIT_REF:-}"   # optional exact commit/tag that yields 1.11.0
+# ROCm/apex master moves (2026-10-18: 2dfd342, version 1.16.0a0). af25af4 (2026-04-20, version 1.11.0) is the
+# commit of the validated build (its apex/git_version_info_installed.py says git_hash=af25af4).
+APEX_GIT_REF="${APEX_GIT_REF:-af25af4e26f0546d897c3e2ff31502ef50530ecc}"
 FLASH_ATTN_TAG="v2.8.3"        # built from source (ROCm needs a source build)
 TORCH_INDEX="https://download.pytorch.org/whl/rocm6.4"   # validated: torch 2.9.1+rocm6.4
 TORCH_VERSION="${TORCH_VERSION:-2.9.1}"

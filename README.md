@@ -1,207 +1,198 @@
+# X-MoE-4D: Pipeline-Parallel Training for Expert-Specialized MoE Models
 
-# X-MoE: Cross-Platform Training Framework for Expert-Specialized MoE
+<!-- Authors: replace the subtitle above with the title of the X-MoE-4D paper once it is public. -->
 
 <p align="center">
-  <img src="images/xmoe-overview.jpg" alt="X-MoE Overview" width="600"/>
+  <img src="images/xmoe-4d-overview.png" alt="X-MoE-4D overview" width="720"/>
 </p>
 
 <p align="center">
-  <!-- [![](https://img.shields.io/badge/Paper-PDF-blue)](https://arxiv.org/abs/2506.20686) -->
-  <a href="https://supercomputing-system-ai-lab.github.io/projects/x-moe/"><img src="https://img.shields.io/badge/project-page-purple" alt="Project Page"></a>
+  <a href="https://supercomputing-system-ai-lab.github.io/projects/x-moe/"><img src="https://img.shields.io/badge/X--MoE-project%20page-purple" alt="X-MoE project page"></a>
+  <a href="https://doi.org/10.5281/zenodo.21840750"><img src="https://img.shields.io/badge/artifact-10.5281%2Fzenodo.21840750-blue" alt="Artifact DOI"></a>
   <img src="https://img.shields.io/badge/NVIDIA-support-green?style=flat&logo=nvidia&logoColor=green" alt="NVIDIA Support">
   <img src="https://img.shields.io/badge/AMD-support-red?style=flat&logo=amd&logoColor=black&labelColor=white" alt="AMD Support">
 </p>
 
 ## 📢 News
-- **2025-07-14**: X-MoE's code released
-- **2025-06-26**: X-MoE has been accepted at **SC 2025** and received **Best Student Paper Nomination**
+- **SC 2026**: X-MoE-4D has been accepted at **SC 2026**. Its code is this branch, `X-MoE-4D`; the artifact of the paper is archived at [10.5281/zenodo.21840750](https://doi.org/10.5281/zenodo.21840750).
+- **2025-07-14**: X-MoE's code released (branch `master`).
+- **2025-06-26**: X-MoE has been accepted at **SC 2025** and received **Best Student Paper Nomination**.
 
 ## 🚀 About
-X-MoE is an **optimized cross-platform framework** for training large-scale **expert-specialized Mixture-of-Experts (MoE)** models (e.g., DeepSeek-MoE style). It introduces system-level enhancements for improved end-to-end throughput and memory efficiency. 
+X-MoE-4D trains large **expert-specialized Mixture-of-Experts (MoE)** models (DeepSeek-MoE style: many
+fine-grained experts, large top-k) with four dimensions of parallelism: data, expert, tensor with
+sequence-sharded MoE blocks, and **pipeline**. It builds on [X-MoE](https://supercomputing-system-ai-lab.github.io/projects/x-moe/)
+(SC 2025), which left pipeline parallelism to future work, and adds what pipeline parallelism needs for these
+models: stages of uneven size, activation checkpointing chosen per stage, a planner that chooses both under a
+memory limit, and grouped-GEMM expert kernels.
 
-This project is built on top of [DeepSpeed](https://github.com/microsoft/DeepSpeed) and [Megatron-DeepSpeed](https://github.com/microsoft/Megatron-DeepSpeed).
-
-
+X-MoE-4D is built on [DeepSpeed](https://github.com/deepspeedai/DeepSpeed) and
+[Megatron-DeepSpeed](https://github.com/deepspeedai/Megatron-DeepSpeed). It is tested on the Frontier
+supercomputer (AMD MI250X) and on AWS p4d nodes (NVIDIA A100-40GB).
 
 ## ✨ Features
 
-### Key Capabilities
+### New in X-MoE-4D
 
-- **Flexible Training Modes**: Support both token-dropping and no-token-dropping training
-- **Padding-Free Design**: Eliminates all zero-paddings to save communication and memory
-- **Communication Optimization**: Reduce inter-node communication overhead on hierarchical networks
-- **Memory Efficiency**: Hybrid TP+SP strategy to reducing activation memory
-- **Cross-Platform Compatibility**: Heterogeneous GPU support
+- **Uneven pipeline stages** (`--uneven-pp-partition 7 8 8 9`): each pipeline stage holds the number of
+  transformer layers given for it, instead of an equal share. Under the 1F1B schedule the first stage keeps the
+  activations of more micro-batches in memory than the last one, so an equal split leaves memory unused on the
+  later stages.
+- **Activation checkpointing per stage** (`--dynamic-checkpoint-partition 1 0 0 0`): on each stage, the first
+  *n* transformer layers recompute their activations in the backward pass and the other layers keep them.
+- **ELM-PP planner** (`ELM_PP_launch.py --run-planner true`): a dynamic program that chooses the layers and the
+  checkpointed layers of every stage so that the slowest stage is as fast as possible while every stage fits a
+  memory limit, then picks the micro-batch size by a model of the pipeline step time. Its inputs are the per-layer
+  forward times of a one-node profiling run and an analytic memory model
+  ([`deepspeed/moe/planner/`](deepspeed/moe/planner)). The planner runs once, before training, on CPU.
+- **Grouped-GEMM experts**: all local experts in one kernel, either the Triton kernel
+  (`--use-groupedGEMM --use-triton`, NVIDIA and AMD) or the Composable Kernel grouped GEMM of
+  [Primus-Turbo](https://github.com/AMD-AGI/Primus-Turbo) (`--use-groupedGEMM` with `USE_AITER_GROUPGEMM=True`,
+  AMD; the bundled fork adds MI250X support).
+- **Two launch paths with the same modes**: Slurm (`scripts-frontier/`) and `torchrun` over ssh for machines
+  without Slurm (`scripts/`).
 
+### From X-MoE
 
-#### Padding-Free MoE Training Pipeline (PFT)
-X-MoE introduces **PFT (Padding-Free Token buffers)**, which eliminates zero-padding through MoE computation and communication stages. We use **Triton-based kernels** to handle sparse and irregular workloads.
-
-
-#### Redundancy-Bypassing Dispatch (RBD)
-A hierarchical multi-stage dispatching process that eliminates redundant inter-node communication by using pilot tokens and local replicas, reducing communication overhead on repeated tokens. It is implemented with Torch.distributed and Triton features.
-
-
-#### Sequence-Sharded MoE Blocks (SSMB)
-A hybrid parallelism strategy that combines tensor-slicing with sequence-sharded execution for MoE blocks, reducing activation memory by a factor of the TP group size while maintaining compatibility with standard MoE routing.
-
-> For DeepSeek-style MoE training, activation can easily become a bottleneck. Please check our paper for analysis and learn about the use case.
-
-
+- **Padding-Free Token buffers (PFT)** (`--use-uneven-all-to-all --use-pft`): the MoE layer stores only the
+  routed tokens, with no zero padding to the expert capacity, through gating, dispatch, the experts and combine.
+- **Redundancy-Bypassing Dispatch (RBD)** (`--use-rbd`): a token that goes to several experts on one remote node
+  crosses the network once and is copied to its experts inside that node.
+- **Sequence-Sharded MoE Blocks (SSMB)** (`--tensor-model-parallel-size <TP>` without
+  `--enable-expert-tensor-parallelism`): the attention is tensor-parallel and each tensor-parallel rank runs the
+  MoE block on its share of the tokens, which divides the MoE activation memory by the tensor-parallel size.
 
 ## 🏁 Quick Start
 
-### Prerequisites
-We use **Megatron-DeepSpeed** as our end-to-end training system. To use the Megatron backend, you need to install the platform-specific version of **APEX**, which may take some time. For efficient end-to-end training, we also recommend installing **Flash Attention**.
-
-#### For NVIDIA Users
-Please follow the commands below to install the corresponding versions of APEX and FlashAttention:
-
+### 1. Clone, with the pinned submodules
 ```bash
-# Install Apex with CUDA extensions
-git clone https://github.com/NVIDIA/apex && cd apex
-pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
-
-# Install FlashAttention (Optional)
-pip install flash-attn --no-build-isolation
-```
-
-#### For AMD Users
-Installation on AMD platforms can be more complex, so we provide a detailed guide. We strongly recommend referring to the **Frontier (MI250X) installation guide** for step-by-step instructions.
-
-**💡 [Frontier Installation Guide](x-moe-docs/frontier-installation-guide.md)**
-
-*[Special] For **Frontier Supercomputer** Users*:
-We have a **pre-built environment** shared on Frontier. You may refer to the installation guide above and directly use that environment.
-
-
-<!-- **Install dependencies**\
-To run X-MoE with Megatron-DeepSpeed framework, Apex and FlashAttention is required. You can install the dependencies by running the following scripts.
-```bash
-# For NVIDIA GPUs:
-./scripts/install_dep_cuda.sh
-
-# For AMD GPUs
-./scripts/install_dep_rocm.sh
-``` -->
-
-<!-- We've provided detailed installation guide for both NVIDIA and AMD platforms. For NVIDIA GPUs, we recommend to directly use our provided -->
-
-### Installing X-MoE
-After installation of the prerequisites, you can now install X-MoE following the commands below:
-
-```bash
-cd ~
-git clone https://github.com/Supercomputing-System-AI-Lab/X-MoE
+git clone -b X-MoE-4D --recurse-submodules https://github.com/Supercomputing-System-AI-Lab/X-MoE
 cd X-MoE
-git submodule update --init --recursive --remote
-
-pip install -e .
-cd Megatron-DeepSpeed-X-MoE && pip install -e .
 ```
+Do not pass `--remote` to `git submodule update`: it moves the submodules from the pinned commits to their branch
+tips.
 
-
-
-## 🏃‍♂️ Running Training with X-MoE
-
-### 📊 Data Preparation
-Before launching your own training, you need to prepare the data to **Megatron's data format**. You may refer to the [Megatron Data Preparation Guide](https://github.com/NVIDIA/Megatron-LM?tab=readme-ov-file#data-preparation).
-
-If you just want to **test the X-MoE training**, we also provide a script to prepare the sample dataset:
+### 2. Build the environment
 ```bash
-cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data
-./prepare_data_ae.sh
+./setup_env_rocm.sh    # AMD, tested on Frontier (ROCm 6.4.1, torch 2.9.1)
+./setup_env_cuda.sh    # NVIDIA, tested on the AWS Deep Learning AMI (CUDA 12.8, torch 2.9.1)
 ```
+Each script builds a conda environment with torch, apex, FlashAttention and mpi4py, and installs X-MoE and
+Megatron-DeepSpeed-X-MoE in editable mode. `XMOE4D_ROOT` sets where the environment, the dependencies and the
+caches go (by default, next to the checkout); `./setup_env_rocm.sh <stage>` reruns one stage. FlashAttention is
+required: the example templates pass `--use-flash-attn-v2`. The manual installation on Frontier is described in
+[`x-moe-docs/frontier-installation-guide.md`](x-moe-docs/frontier-installation-guide.md).
 
-### 🚀 Launch Your Training Example
-
-We provide training examples with **two launching methods**: `torchrun` and `srun`. Below is the structure of the example scripts we provided:
-
+### 3. Prepare the sample data
 ```bash
-examples_xmoe_4d/
-├── scripts/           # scripts using torchrun to launch; tested with NVIDIA A100 node
-│   ├── run_exp_training.sh          # one-command launcher (env_validate / training / ...)
-│   ├── autorun.sh                   # map-driven multi-config launcher
-│   └── xmoe_4d.sh.template          # per-run driver rendered by the two above
-└── scripts-frontier/  # scripts using srun to launch; tested on Frontier (MI250X)
-    ├── run_exp_training.sh          # one-command launcher
-    ├── autorun_frontier.sh          # map-driven multi-config launcher
-    └── frontier_xmoe_4d.slurm.template
+cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/data
+bash prepare_data_ae.sh
 ```
+For your own data, use Megatron's data format ([Megatron data preparation](https://github.com/NVIDIA/Megatron-LM?tab=readme-ov-file#data-preparation)).
 
-**Quick Start Recommendation**: Use `./run_exp_training.sh env_validate` to launch a **10B DeepSeek-MoE-like model** training task on one GPU node with multiple GPUs. See
-[`examples_xmoe_4d/README.md`](Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/README.md) for the full
-set of modes and for reproducing the paper's results.
-
-#### Option 1: Using torchrun (NVIDIA)
+### 4. Validate the installation
+With `torchrun` (one node, 8 GPUs):
 ```bash
-cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
+cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts
 ./run_exp_training.sh env_validate
 ```
-
-#### Option 2: Using srun (Frontier Supercomputer)
+With Slurm on Frontier:
 ```bash
-cd ~/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts-frontier
+export SBATCH_ACCOUNT=<your project>
+cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts-frontier
 ./run_exp_training.sh env_validate
 ```
+`env_validate` trains X-MoE 10B for 10 iterations on one node (pipeline size 2, expert-parallel size 4). The first
+run compiles kernels, which can take about ten minutes more.
 
-> **Note**: The first run may require an additional 10 minutes to compile kernels.
+## 🏃 Running X-MoE-4D
 
-**Expectation**:
-After initialization, you can see the training logs during training progress in the terminal. The training logs will also be saved as a log file. When using one computing node on Frontier (4*MI250X GPUs), the expected throughput is ~50-55 TFLOPs with X-MoE optimizations.
-
-### ⚙️ How to Enable X-MoE Optimizations?
-
-#### Basic Optimizations
-We integrated the X-MoE optimization API into **Megatron's launching arguments**. Specify these flags to enable basic optimizations:
+`run_exp_training.sh` runs one experiment per command; the
+[examples README](https://github.com/Supercomputing-System-AI-Lab/Megatron-DeepSpeed/blob/X-MoE-4D/examples_xmoe_4d/README.md) describes every mode, the map-driven
+launcher `autorun_frontier.sh` and the execution flow.
 
 ```bash
---use-uneven-all-to-all \
---use-pft
+./run_exp_training.sh profiling_cache X-MoE-4D      # one-node profiles for the planner (once per GPU type)
+./run_exp_training.sh training X-MoE-4D             # planner, uneven stages, per-stage checkpointing
+./run_exp_training.sh training X-MoE-4D no_planner  # even stages, every layer checkpointed
+./run_exp_training.sh training X-MoE-4D TritonGroupGEMM
+./run_exp_training.sh training X-MoE                # baselines: X-MoE, DS-MoE, DS-TED, DS-Tutel
+./run_exp_training.sh main_results                  # X-MoE-4D with and without the planner, X-MoE, DS-MoE, DS-Tutel
+./run_exp_training.sh loss_validate                 # X-MoE-4D against X-MoE on the 10B model
 ```
 
-These flags enable **padding-free format training** and corresponding kernels.
+The planner profiles measured on Frontier ship in
+`examples_xmoe_4d/scripts-frontier/planner_profiling_cache_mi250x/`; on any other GPU, run `profiling_cache` first.
+Multi-node `torchrun` needs a host file and a shared file system: see
+[`x-moe-docs/aws-multinode-guide.md`](x-moe-docs/aws-multinode-guide.md).
 
-#### Advanced Optimizations (Large-scale, Multi-node)
+### ⚙️ The flags
 
-I. *Redundancy-Bypassing Dispatch*: For DeepSeek-style model training on multi-node settings, specify:
-```bash
---use-rbd
-```
-This enables **redundancy-bypassing dispatching** and may reduce all-to-all communication time.
+| Flag | Effect |
+|---|---|
+| `--use-uneven-all-to-all --use-pft` | X-MoE's padding-free MoE layer |
+| `--use-rbd` | redundancy-bypassing dispatch (needs the two flags above) |
+| `--tensor-model-parallel-size <TP>` | tensor parallelism; the MoE blocks are sequence-sharded unless `--enable-expert-tensor-parallelism` is given |
+| `--pipeline-model-parallel-size <PP>` | pipeline parallelism |
+| `--uneven-pp-partition n0 n1 ...` | transformer layers of each pipeline stage |
+| `--dynamic-checkpoint-partition c0 c1 ...` | checkpointed layers of each pipeline stage (with `--checkpoint-activations`) |
+| `--use-groupedGEMM [--use-triton]` | grouped-GEMM experts: Triton, or Primus-Turbo with `USE_AITER_GROUPGEMM=True` |
+| `ELM_PP_launch.py --run-planner true` | run the planner and pass its partition and checkpoint counts to training |
 
-II. *Sequence Sharding for Memory Optimization*:
-If activation memory becomes a bottleneck, specify:
+## ⚠️ Known limitations of this release
 
-```bash
---tensor-model-parallel-size <TP_SIZE>
-```
+These are properties of the code that produced the paper's results. Fixing them changes the training numerics, so
+they are not changed in this release.
 
-When `--enable-expert-tensor-parallelism` is *not* specified, the above flag will automatically enable **sequence sharding for MoE blocks**.
-
----
+- **Pipeline runs train without the MoE auxiliary loss.** `ParallelTransformerLayerPipe.forward` drops the
+  load-balancing loss, as upstream Megatron-DeepSpeed does; runs with pipeline size 1 keep it.
+- **Combine weights are top-k logits.** The padding-free gate (`deepspeed/moe/moe_v2.py`, `topkgating_unbalanced`)
+  weights the expert outputs with the top-k raw logits, not with softmax probabilities.
+- **Rotary positions in bf16.** With `--bf16` and pipeline size 1, the rotary positions are rounded to bf16, so
+  positions above 256 are approximate.
+- **Gradient clipping under uneven stages.** With `--uneven-pp-partition`, the model-parallel group that ZeRO
+  reduces the gradient norm over is the tensor-parallel group, so each pipeline stage clips with its own norm.
+- **Router gradients under tensor parallelism.** With SSMB, the router gradients are not summed over the
+  tensor-parallel ranks.
+- **Checkpoints of grouped-GEMM experts.** Saving a checkpoint with `--use-groupedGEMM` fails; the examples do not
+  save checkpoints.
+- **Expert biases differ between kernels.** The sequential experts keep a bias per expert on both projections; the
+  Triton kernel shares one up-projection bias; the Primus examples pass `--disable-bias-linear`. Pass
+  `--disable-bias-linear` to all three when comparing them.
+- Megatron's `--sequence-parallel` and Ulysses sequence parallelism are not supported in this release.
 
 ## 📊 Evaluation
 
-Our evaluation on the **Frontier supercomputer** demonstrates that X-MoE enables:
+<!-- Authors: add the X-MoE-4D result figure and its numbers from the paper here. -->
 
-- Training of models up to **545B parameters** on **1024 AMD GPUs**
-- **10× larger** than existing solutions  
-- Up to **1.42× higher** training throughput
+X-MoE (SC 2025) trains DeepSeek-style models of up to 545B parameters on 1,024 AMD GPUs of Frontier, 10 times
+larger than existing solutions under the same hardware budget, with up to 1.42 times higher training throughput:
 
 <p align="center">
-  <img src="images/main-result.jpg" alt="X-MoE Performance Results" width="600"/>
+  <img src="images/main-result.jpg" alt="X-MoE performance results" width="600"/>
 </p>
 
 ## 📝 Citation
 ```
+@inproceedings{xmoe4d2026,
+  title     = {X-MoE-4D: <title of the SC 2026 paper>},
+  author    = {Zixian Wang and Liheng Jing and Emily Herron and Sajal Dash and Feiyi Wang and Minjia Zhang},
+  booktitle = {Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC)},
+  year      = {2026}
+}
+
 @misc{yuan2025xmoeenablingscalabletraining,
-      title={X-MoE: Enabling Scalable Training for Emerging Mixture-of-Experts Architectures on HPC Platforms}, 
+      title={X-MoE: Enabling Scalable Training for Emerging Mixture-of-Experts Architectures on HPC Platforms},
       author={Yueming Yuan and Ahan Gupta and Jianping Li and Sajal Dash and Feiyi Wang and Minjia Zhang},
       year={2025},
       eprint={2508.13337},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2508.13337}, 
+      url={https://arxiv.org/abs/2508.13337},
 }
 ```
+
+## License
+
+Apache-2.0, as DeepSpeed. The code taken from other projects and its licenses are listed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

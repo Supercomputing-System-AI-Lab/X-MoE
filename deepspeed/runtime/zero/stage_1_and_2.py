@@ -218,6 +218,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.model_parallel_group = mpu.get_model_parallel_group()
             self.model_parallel_world_size = mpu.get_model_parallel_world_size()
             self.model_parallel_rank = bwc_tensor_model_parallel_rank(mpu)
+        # The gradient norm is summed over every rank that holds a different part of this model replica: all pipeline
+        # stages and tensor slices. For the pipeline grid that is its ds_model_proc_group. get_model_parallel_group() is
+        # not used for it, because with UNEVEN_PP=True the X-MoE grid returns the tensor-slice group there (and its size
+        # from get_model_parallel_world_size()), so each stage clipped by its own norm (pipe/topology.py). Without a
+        # pipeline grid (no ds_model_proc_group) this is the model-parallel group, as before.
+        if mpu is not None and getattr(mpu, 'ds_model_proc_group', None) is not None:
+            self.norm_group, self.norm_group_size = mpu.ds_model_proc_group, mpu.ds_model_world_size
+        else:
+            self.norm_group, self.norm_group_size = self.model_parallel_group, self.model_parallel_world_size
 
         self.overflow = False
         self.clip_grad = clip_grad
@@ -1815,7 +1824,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.cpu_offload:
             return torch.norm(torch.stack(norm_groups), p=norm_type)
         total_sq = torch.stack(norm_groups).square().sum().float()
-        self._model_parallel_all_reduce(tensor=total_sq, op=dist.ReduceOp.SUM)     # one collective on every stage
+        if self.norm_group is not None and self.norm_group_size > 1:     # one collective on every stage and slice
+            dist.all_reduce(tensor=total_sq, op=dist.ReduceOp.SUM, group=self.norm_group)
         total_norm = total_sq.sqrt()
         inf_or_nan = total_norm.isnan().logical_or(total_norm.isinf())
         err = torch.tensor(-1.0, device=self.device, dtype=torch.float)

@@ -51,6 +51,8 @@ A hybrid parallelism strategy that combines tensor-slicing with sequence-sharded
 
 ## 🏁 Quick Start
 
+> **Branch `ft-sys-v2`** (failure detection and warm recovery on Frontier): clone, environment and examples in [FT_SYS_V2.md](FT_SYS_V2.md).
+
 ### Prerequisites
 We use **Megatron-DeepSpeed** as our end-to-end training system. To use the Megatron backend, you need to install the platform-specific version of **APEX**, which may take some time. For efficient end-to-end training, we also recommend installing **Flash Attention**.
 

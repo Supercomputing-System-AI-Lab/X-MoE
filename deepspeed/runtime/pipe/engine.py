@@ -1,3 +1,4 @@
+import sys
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -718,6 +719,9 @@ class PipelineEngine(DeepSpeedEngine):
         return batch
 
     def _exec_forward_pass(self, buffer_id):
+        _xh = sys.modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-10, sandbox] the heartbeat phase under the pipeline engine
+        if _xh is not None:
+            _xh.set_phase('forward')
         self.tput_timer.start()
         self.mem_status('BEFORE FWD', reset_max=True)
 
@@ -812,6 +816,9 @@ class PipelineEngine(DeepSpeedEngine):
                     self.total_additional_losses[name] = add_to_total_loss(total, loss)
 
     def _exec_backward_pass(self, buffer_id):
+        _xh = sys.modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-10, sandbox] the heartbeat phase under the pipeline engine
+        if _xh is not None:
+            _xh.set_phase('backward')
         assert self.optimizer is not None, "must provide optimizer during " \
                                            "init in order to use backward"
 
@@ -1225,6 +1232,9 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(PIPE_RECV_GRAD_TIMER).stop()
 
     def _exec_optimizer_step(self, lr_kwargs=None):
+        _xh = sys.modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-10, sandbox] the heartbeat phase under the pipeline engine
+        if _xh is not None:
+            _xh.set_phase('step')
         if self.wall_clock_breakdown():
             self.timers(STEP_MICRO_TIMER).start()
             self.timers(STEP_GLOBAL_TIMER).start()

@@ -417,12 +417,15 @@ class MOEv2Layer(Base):
                     self.time_dispatch = self.timers(DISPATCH_TIMER).elapsed(reset=False)
         
         with record_function("MoE - Dispatch A2A - 1"):
+            _xh = __import__('sys').modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-09] heartbeat hook (XMOE_HB=1): coll_seq += 1, phase
+            if _xh: _xh.coll_enter('all_to_all')
             output_splits_tensor = _AllToAll.apply(self.ep_group, input_splits_tensor)
             input_splits_tensor_ep = input_splits_tensor.view(-1, self.num_local_experts).sum(dim=1)
             output_splits_tensor_ep = output_splits_tensor.view(-1, self.num_local_experts).sum(dim=1)
 
             input_splits = input_splits_tensor_ep.tolist()
             output_splits = output_splits_tensor_ep.tolist()
+            if _xh: _xh.coll_exit()   # the .tolist() above is where a rank waits for a missing peer
 
         assert sum(input_splits) == flattened_input.shape[0], f"input_split sum {sum(input_splits)} != input shape [0] {flattened_input.shape[0]} on rank {dist.get_rank()}"
 
@@ -434,7 +437,9 @@ class MOEv2Layer(Base):
             # print (f'[moe_v2 MOEv2Layer forward before _AllToAllSingle.apply]')
 
             # dispatch all-to-all    
+            if _xh: _xh.coll_enter('all_to_all')
             dispatched_output = _AllToAllSingle.apply(self.ep_group, flattened_input, input_splits, output_splits)
+            if _xh: _xh.coll_exit()
 
             if self.wall_clock_breakdown:
                 torch.distributed.barrier()
@@ -490,7 +495,9 @@ class MOEv2Layer(Base):
             
             # combine all-to-all
             with record_function ("MoE - Combine A2A"): 
+                if _xh: _xh.coll_enter('all_to_all')
                 expert_output_uneven = _AllToAllSingle.apply(self.ep_group, expert_output_uneven_interleaved, output_splits, input_splits)
+                if _xh: _xh.coll_exit()
         
             # # If using triton groupgemm 
             # # Zixian: TODO: change the following if to use "use_triton" and "use_groupgemm" 

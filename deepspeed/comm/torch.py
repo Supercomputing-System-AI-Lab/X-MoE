@@ -348,6 +348,12 @@ class TorchBackend(Backend):
         return torch.distributed.get_backend(group=group)
 
     def new_group(self, ranks):
+        # [X-MoE resilience 2026-10-09] D1: the groups DeepSpeed creates (the expert-parallel group among them) passed no timeout
+        # and took torch's 10-minute default (measured: HANG2 5639642); XMOE_PG_TIMEOUT_MIN makes it configurable. Unset = as before.
+        _t = os.environ.get('XMOE_PG_TIMEOUT_MIN')
+        if _t:
+            from datetime import timedelta
+            return torch.distributed.new_group(ranks, timeout=timedelta(minutes=float(_t)))
         return torch.distributed.new_group(ranks)
 
     def get_global_rank(self, group, group_rank):

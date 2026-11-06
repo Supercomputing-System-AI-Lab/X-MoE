@@ -205,7 +205,10 @@ def single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, asyn
                                         head_dim)
 
     output = torch.empty_like(input_t)
+    _xh = __import__('sys').modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-09] heartbeat hook (XMOE_HB=1): coll_seq += 1, phase
+    if _xh: _xh.coll_enter('all_to_all')
     work = dist.all_to_all_single(output, input_t, group=group, async_op=async_op)
+    if _xh: _xh.coll_exit()
 
     if async_op:
         if type in ('dq', 'dk'):

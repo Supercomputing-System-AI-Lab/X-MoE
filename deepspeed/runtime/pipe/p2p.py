@@ -57,7 +57,12 @@ def send(tensor, dest_stage, async_op=False):
     else:
 
         if can_send_recv():
-            return dist.send(tensor, dest_rank)
+            _xh = __import__('sys').modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-09] heartbeat hook (XMOE_HB=1): coll_seq += 1, phase
+            if _xh: _xh.coll_enter('p2p')
+            try:
+                return dist.send(tensor, dest_rank)
+            finally:
+                if _xh: _xh.coll_exit()
         else:
             group = _get_send_recv_group(src_stage, dest_stage)
             src_rank = _grid.stage_to_global(stage_id=src_stage)
@@ -78,7 +83,12 @@ def recv(tensor, src_stage, async_op=False):
         _async.append(op)
     else:
         if can_send_recv():
-            return dist.recv(tensor, src_rank)
+            _xh = __import__('sys').modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-09] heartbeat hook (XMOE_HB=1): coll_seq += 1, phase
+            if _xh: _xh.coll_enter('p2p')
+            try:
+                return dist.recv(tensor, src_rank)
+            finally:
+                if _xh: _xh.coll_exit()
         else:
             group = _get_send_recv_group(src_stage, dest_stage)
             return dist.broadcast(tensor, src_rank, group=group, async_op=async_op)

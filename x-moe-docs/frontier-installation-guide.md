@@ -39,10 +39,14 @@ variables to export in the training environment.
 ```bash
 module reset
 module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja
+export LD_LIBRARY_PATH=/opt/cray/pe/mpich/9.0.0/gtl/lib:$LD_LIBRARY_PATH   # cray-mpich 9.1.0's GTL needs ROCm 7 since 2026-11-10
 export CXX=/opt/cray/pe/gcc-native/13/bin/g++
 export CC=/opt/cray/pe/gcc-native/13/bin/gcc
 ```
 
+Since Frontier's programming-environment update of 2026-11-10, the GPU transport library (GTL) of `cray-mpich/9.1.0`
+requires ROCm 7, and `from mpi4py import MPI` fails under `rocm/6.4.1` with `libamdhip64.so.7: cannot open shared
+object file`. The GTL of cray-mpich 9.0.0 is built for ROCm 6, and the `export LD_LIBRARY_PATH` line puts it first.
 The GCC 13 compilers avoid C++ ABI mismatches when PyTorch extensions and kernels are built. Export them in every
 new shell before training too.
 
@@ -100,6 +104,7 @@ no environment), so load the modules, activate the environment and source the ru
 ```bash
 module reset
 module load cpe/24.11 PrgEnv-gnu/8.6.0 rocm/6.4.1 cray-mpich/9.1.0 craype-accel-amd-gfx90a miniforge3/23.11.0-0 ninja
+export LD_LIBRARY_PATH=/opt/cray/pe/mpich/9.0.0/gtl/lib:$LD_LIBRARY_PATH   # cray-mpich 9.1.0's GTL needs ROCm 7 since 2026-11-10
 conda activate <XMOE4D_ROOT>/XMoE4D_envs/X-MoE-4D-ROCM6.4.1_repro
 source <XMOE4D_ROOT>/XMoE4D_deps/xmoe_4d_runtime_env.sh    # from the aws-ofi-rccl stage: plugin, CC/CXX
 export SBATCH_ACCOUNT=<your project>

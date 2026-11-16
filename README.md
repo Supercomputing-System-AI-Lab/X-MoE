@@ -9,8 +9,8 @@ the cross-node all-to-all. Pipeline-global, expert-local execution removes it bu
 ELM-PP mitigates by balancing the pipeline stages. Grouped-GEMM expert kernels improve the utilization of the experts.</em></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/NVIDIA-support-green?style=flat&logo=nvidia&logoColor=green" alt="NVIDIA Support">
   <img src="https://img.shields.io/badge/AMD-support-red?style=flat&logo=amd&logoColor=black&labelColor=white" alt="AMD Support">
+  <img src="https://img.shields.io/badge/NVIDIA-support-green?style=flat&logo=nvidia&logoColor=green" alt="NVIDIA Support">
 </p>
 
 This repository contains two systems for training expert-specialized Mixture-of-Experts (MoE) models on HPC

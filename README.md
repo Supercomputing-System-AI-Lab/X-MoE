@@ -20,6 +20,7 @@ padding-free MoE layer, redundancy-bypassing dispatch and sequence-sharded MoE b
 
 ## 📢 News
 - **SC 2026**: X-MoE-4D has been accepted at **SC 2026**.
+- **Blog**: [X-MoE-4D: Breaking the Scaling Barrier for Trillion-Parameter MoEs on Hierarchical HPC Systems](blogs/x-moe-4d/README.md) explains the design and the results.
 - **2025-07-14**: X-MoE's code released.
 - **2025-06-26**: X-MoE has been accepted at **SC 2025** and received a **Best Student Paper Nomination**.
 
@@ -40,6 +41,8 @@ as fast as possible within the memory limit.
 On Frontier (AMD MI250X), X-MoE-4D trains a 1T-parameter MoE model at 24.8 % MFU on 960 GPUs, 2.24 times the
 throughput of X-MoE on 1,024 GPUs. On a 173B-parameter model, it maintains 36 % MFU in weak scaling up to 1,152 GPUs,
 and at 2,304 GPUs it is 3.24 times faster than X-MoE on 2,048 GPUs. On Frontier, a GPU is one GCD of an MI250X.
+
+The [release blog](blogs/x-moe-4d/README.md) explains these choices step by step.
 
 X-MoE-4D is built on [DeepSpeed](https://github.com/deepspeedai/DeepSpeed) and
 [Megatron-DeepSpeed](https://github.com/deepspeedai/Megatron-DeepSpeed). It is tested on the Frontier supercomputer

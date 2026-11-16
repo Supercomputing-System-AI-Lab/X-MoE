@@ -9,8 +9,6 @@ the cross-node all-to-all. Pipeline-global, expert-local execution removes it bu
 ELM-PP mitigates by balancing the pipeline stages. Grouped-GEMM expert kernels improve the utilization of the experts.</em></p>
 
 <p align="center">
-  <a href="https://supercomputing-system-ai-lab.github.io/projects/x-moe/"><img src="https://img.shields.io/badge/X--MoE-project%20page-purple" alt="X-MoE project page"></a>
-  <a href="https://doi.org/10.5281/zenodo.22103995"><img src="https://img.shields.io/badge/artifact-10.5281%2Fzenodo.22103995-blue" alt="Artifact DOI"></a>
   <img src="https://img.shields.io/badge/NVIDIA-support-green?style=flat&logo=nvidia&logoColor=green" alt="NVIDIA Support">
   <img src="https://img.shields.io/badge/AMD-support-red?style=flat&logo=amd&logoColor=black&labelColor=white" alt="AMD Support">
 </p>
@@ -21,8 +19,7 @@ pipeline parallelism. **X-MoE** (SC 2025), described in the [second part](#x-moe
 padding-free MoE layer, redundancy-bypassing dispatch and sequence-sharded MoE blocks, which X-MoE-4D also uses.
 
 ## 📢 News
-- **SC 2026**: X-MoE-4D has been accepted at **SC 2026**. The artifact of the paper is archived at
-  [10.5281/zenodo.22103995](https://doi.org/10.5281/zenodo.22103995).
+- **SC 2026**: X-MoE-4D has been accepted at **SC 2026**.
 - **2025-07-14**: X-MoE's code released.
 - **2025-06-26**: X-MoE has been accepted at **SC 2025** and received a **Best Student Paper Nomination**.
 

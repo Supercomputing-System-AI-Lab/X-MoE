@@ -185,28 +185,6 @@ reduces the step time from 325.7 s on 288 GPUs to 43.1 s on 2,304 GPUs, and it i
 2,048 GPUs. On 480 GPUs, the ELM-PP plan improves the MFU over recomputation in every stage by 6.4 % for the 537B
 model and by 15.3 % for the 1T model.
 
-## ⚠️ Known limitations of this release
-
-These are properties of the code that produced the paper's results. Fixing them changes the training numerics, so
-they are not changed in this release.
-
-- **Pipeline runs train without the MoE auxiliary loss.** `ParallelTransformerLayerPipe.forward` drops the
-  load-balancing loss, as upstream Megatron-DeepSpeed does. Runs with pipeline size 1 keep it.
-- **Combine weights are top-k logits.** The padding-free gate (`deepspeed/moe/moe_v2.py`, `topkgating_unbalanced`)
-  weights the expert outputs with the top-k raw logits, not with softmax probabilities.
-- **Rotary positions in bf16.** With `--bf16` and pipeline size 1, the rotary positions are rounded to bf16, so
-  positions above 256 are approximate.
-- **Gradient clipping under uneven stages.** With `--uneven-pp-partition`, the model-parallel group that ZeRO reduces
-  the gradient norm over is the tensor-parallel group, so each pipeline stage clips with its own norm.
-- **Router gradients under tensor parallelism.** With SSMB, the router gradients are not summed over the
-  tensor-parallel ranks.
-- **Checkpoints of grouped-GEMM experts.** Saving a checkpoint with `--use-groupedGEMM` fails. The examples do not
-  save checkpoints.
-- **Expert biases differ between kernels.** The sequential experts keep a bias per expert on both projections, the
-  Triton kernel shares one up-projection bias, and the Primus examples pass `--disable-bias-linear`. Pass
-  `--disable-bias-linear` to all three when comparing them.
-- Megatron's `--sequence-parallel` and Ulysses sequence parallelism are not supported in this release.
-
 ## 📝 Citation
 ```
 @inproceedings{wang2026xmoe4d,

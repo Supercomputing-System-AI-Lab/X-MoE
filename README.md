@@ -15,7 +15,7 @@ ELM-PP mitigates by balancing the pipeline stages. Grouped-GEMM expert kernels i
 
 This repository contains two systems for training expert-specialized Mixture-of-Experts (MoE) models on HPC
 platforms. **X-MoE-4D** (SC 2026), described first, scales training with intra-node expert parallelism and inter-node
-pipeline parallelism. **X-MoE** (SC 2025, best student paper), described in the [second part](#x-moe-sc-2025), introduced the
+pipeline parallelism. **X-MoE** (SC 2025, Best Student Paper Award), described in the [second part](#x-moe-sc-2025), introduced the
 padding-free MoE layer, redundancy-bypassing dispatch and sequence-sharded MoE blocks, which X-MoE-4D also uses.
 
 ## 📖 Blogs
@@ -25,7 +25,7 @@ padding-free MoE layer, redundancy-bypassing dispatch and sequence-sharded MoE b
 ## 📢 News
 - **SC 2026**: X-MoE-4D has been accepted at **SC 2026**.
 - **2025-07-14**: X-MoE's code released.
-- **2025-06-26**: X-MoE has been accepted at **SC 2025** and received a **Best Student Paper Nomination**.
+- **2025-06-26**: X-MoE has been accepted at **SC 2025** and received the **Best Student Paper Award**.
 
 ---
 

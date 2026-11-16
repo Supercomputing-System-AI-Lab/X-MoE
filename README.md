@@ -1,8 +1,12 @@
 # X-MoE-4D: Breaking the Scaling Barrier for Trillion-Parameter MoEs on Hierarchical HPC Systems
 
 <p align="center">
-  <img src="images/xmoe-4d-overview.png" alt="X-MoE-4D overview" width="720"/>
+  <img src="images/xmoe4d-overview.png" alt="Overview of X-MoE-4D" width="720"/>
 </p>
+
+<p align="center"><em>Overview of X-MoE-4D (Figure 5 of the paper). Scaling expert parallelism across nodes is limited by
+the cross-node all-to-all. Pipeline-global, expert-local execution removes it but introduces MoE Pipeline Skew, which
+ELM-PP mitigates by balancing the pipeline stages. Grouped-GEMM expert kernels improve the utilization of the experts.</em></p>
 
 <p align="center">
   <a href="https://supercomputing-system-ai-lab.github.io/projects/x-moe/"><img src="https://img.shields.io/badge/X--MoE-project%20page-purple" alt="X-MoE project page"></a>

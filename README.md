@@ -18,9 +18,12 @@ platforms. **X-MoE-4D** (SC 2026), described first, scales training with intra-n
 pipeline parallelism. **X-MoE** (SC 2025), described in the [second part](#x-moe-sc-2025), introduced the
 padding-free MoE layer, redundancy-bypassing dispatch and sequence-sharded MoE blocks, which X-MoE-4D also uses.
 
+## 📖 Blogs
+- [X-MoE-4D: Breaking the Scaling Barrier for Trillion-Parameter MoEs on Hierarchical HPC Systems](blogs/x-moe-4d/README.md)
+- [X-MoE: Scaling DeepSeek-style MoEs on Frontier: what broke, what we fixed, and what to learn](https://supercomputing-system-ai-lab.github.io/blogs/blog/x-moe-scaling-deepseek-style-moes-on-frontierwhat-broke-what-we-fixed-and-what-to-learn/)
+
 ## 📢 News
 - **SC 2026**: X-MoE-4D has been accepted at **SC 2026**.
-- **Blog**: [X-MoE-4D: Breaking the Scaling Barrier for Trillion-Parameter MoEs on Hierarchical HPC Systems](blogs/x-moe-4d/README.md) explains the design and the results.
 - **2025-07-14**: X-MoE's code released.
 - **2025-06-26**: X-MoE has been accepted at **SC 2025** and received a **Best Student Paper Nomination**.
 
